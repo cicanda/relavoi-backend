@@ -2,11 +2,11 @@ import { randomUUID } from 'crypto';
 import { getDb } from '../config/database';
 import { logger } from '../utils/logger';
 
-export type AuditActor = 'operator' | 'tenant_user' | 'system';
+export type AuditActor = 'operator' | 'tenant' | 'system';
 
 export interface AuditEntry {
   actorType: AuditActor;
-  actorId?: string;
+  actorId: string; // required: schema column is NOT NULL
   action: string;
   resourceType: string;
   resourceId?: string;
@@ -26,12 +26,12 @@ export class AuditLogger {
       await db('audit_log').insert({
         id: randomUUID(),
         actor_type: entry.actorType,
-        actor_id: entry.actorId ?? null,
+        actor_id: entry.actorId,
         action: entry.action,
         resource_type: entry.resourceType,
         resource_id: entry.resourceId ?? null,
-        metadata: entry.metadata ? JSON.stringify(entry.metadata) : null,
-        ip: entry.ip ?? null,
+        details: entry.metadata ? JSON.stringify(entry.metadata) : '{}',
+        ip_address: entry.ip ?? null,
         created_at: new Date(),
       });
     } catch (err) {

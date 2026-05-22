@@ -503,7 +503,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
           action: r.action,
           resourceType: r.resource_type,
           resourceId: r.resource_id,
-          metadata: r.metadata,
+          metadata: r.details,
           createdAt: r.created_at,
         })),
         pagination: {

@@ -1,152 +1,223 @@
+import crypto from 'crypto';
 import bcrypt from 'bcrypt';
 import { getDb } from '../config/database';
 import { getRedis } from '../config/redis';
 import { logger } from '../utils/logger';
 
 const TENANT_ID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
-const TENANT_NAME = 'Test Tenant Corp';
+const TENANT_NAME = 'Chowdeck';
+const BILLING_EMAIL = 'dev@chowdeck.com';
 const DEV_API_KEY = 'sk_test_relavoi_dev_0123456789abcdef';
 const DEV_API_SECRET = 'secret_test_relavoi_dev_fedcba9876543210';
-const TENANT_USER_EMAIL = 'adaeze@testcorp.com';
-const TENANT_USER_PASSWORD = 'Test1234!';
-const TENANT_USER_NAME = 'Adaeze Test';
+
+const TENANT_USER_EMAIL = 'dev@chowdeck.com';
+const TENANT_USER_PASSWORD = 'password123';
+const TENANT_USER_NAME = 'Adaeze Okafor';
+
 const OPERATOR_EMAIL = 'admin@relavoi.com';
-const OPERATOR_PASSWORD = 'Admin1234!';
-const OPERATOR_NAME = 'Root Admin';
+const OPERATOR_PASSWORD = 'admin123';
+const OPERATOR_NAME = 'Olu Kalubridge';
 
-const BCRYPT_ROUNDS = 10;
-const PROXY_PREFIX = '+234800000000';
 const PROXY_COUNT = 10;
-const REGION = 'NG';
-const PROVIDER = 'AFRICASTALKING';
+const PROXY_REGION = 'lagos';
+const PROXY_PROVIDER = 'AFRICASTALKING';
 
-/**
- * Truncate all tenant-owned data and re-seed a known dev tenant.
- * Preserves: tier_pricing, operators (only inserts operator if missing).
- */
+function sha256(s: string): string {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
 export async function runDevSeed(): Promise<void> {
   const db = getDb();
   const redis = getRedis();
 
-  logger.info('dev-seed: clearing tenant-owned data');
-
-  // Truncate in FK-safe order
-  const TRUNCATE_ORDER = [
-    'tenant_webhook_subscriptions',
-    'billing_periods',
-    'usage_records',
+  // Wipe in FK-safe order — preserve tier_pricing (separate seed) and operators (we re-upsert)
+  const wipeOrder = [
     'audit_log',
-    'webhook_logs',
     'webhook_delivery_logs',
-    'push_templates',
+    'usage_records',
+    'webhook_dlq',
     'device_tokens',
     'sms_records',
     'call_records',
     'sessions',
-    'proxy_numbers',
+    'billing_periods',
     'tenant_users',
-    'tenants',
   ];
-
-  for (const table of TRUNCATE_ORDER) {
+  for (const table of wipeOrder) {
     try {
       await db(table).del();
     } catch (err) {
-      logger.warn({ err, table }, 'dev-seed: truncate failed (table may not exist yet)');
+      logger.warn({ err, table }, 'wipe: skipping (table may not exist)');
     }
   }
+  // tenants has a FK from billing_periods; we cleared billing_periods first
+  // but tenants.current_billing_period_id may still reference a now-gone row — null it
+  try {
+    await db('tenants').update({ current_billing_period_id: null });
+    await db('tenants').del();
+  } catch (err) {
+    logger.warn({ err }, 'wipe: tenants');
+  }
+  try {
+    await db('proxy_numbers').del();
+  } catch (err) {
+    logger.warn({ err }, 'wipe: proxy_numbers');
+  }
 
-  // Tenant
-  logger.info({ tenantId: TENANT_ID }, 'dev-seed: creating tenant');
-  const apiKeyHash = await bcrypt.hash(DEV_API_KEY, BCRYPT_ROUNDS);
-  const apiSecretHash = await bcrypt.hash(DEV_API_SECRET, BCRYPT_ROUNDS);
+  // Clear Redis pool sets for clean slate
+  try {
+    await redis.del(`pool:${PROXY_REGION}:available`);
+    await redis.del(`pool:${PROXY_REGION}:${PROXY_PROVIDER}:available`);
+  } catch (err) {
+    logger.warn({ err }, 'wipe: redis pool');
+  }
+
+  // ─── Tenant ─────────────────────────────────────────────────────────────────
+  const apiKeyHash = sha256(DEV_API_KEY);
+  const apiSecretHash = await bcrypt.hash(DEV_API_SECRET, 10);
 
   await db('tenants').insert({
     id: TENANT_ID,
     name: TENANT_NAME,
     api_key_hash: apiKeyHash,
     api_secret_hash: apiSecretHash,
-    webhook_url: null,
-    webhook_secret: null,
-    default_grace_period: 15,
-    expired_call_behavior: 'DEAD_LINE',
-    support_phone: null,
-    push_config: JSON.stringify({}),
-    recording_enabled: false,
-    recording_consent_mode: 'DEFAULT',
+    billing_email: BILLING_EMAIL,
     tier: 'GROWTH',
-    status: 'ACTIVE',
+    workspace_slug: 'chowdeck',
+    country: 'NG',
+    industry: 'Delivery',
+    default_session_ttl_min: 120,
+    cooldown_min: 5,
+    requested_pool_size: 250,
+    onboarding_metadata: JSON.stringify({
+      expectedSessionsPerDay: '2,000-5,000',
+      avgSessionLifespan: '1-3h',
+      regions: ['Lagos', 'Abuja', 'Port Harcourt'],
+      useCaseDetail: 'Delivery',
+    }),
+    push_enabled: true,
+    push_title_template: 'Incoming Call',
+    push_body_template: 'You are receiving a call from Chowdeck',
+    billing_currency: 'NGN',
   });
 
-  // Tenant user
-  logger.info({ email: TENANT_USER_EMAIL }, 'dev-seed: creating tenant user');
-  const userPasswordHash = await bcrypt.hash(TENANT_USER_PASSWORD, BCRYPT_ROUNDS);
-  await db('tenant_users').insert({
-    tenant_id: TENANT_ID,
-    email: TENANT_USER_EMAIL,
-    password_hash: userPasswordHash,
-    name: TENANT_USER_NAME,
-    role: 'OWNER',
-    is_active: true,
+  // ─── Tenant user (OWNER) ────────────────────────────────────────────────────
+  const tenantUserPasswordHash = await bcrypt.hash(TENANT_USER_PASSWORD, 10);
+  const [tenantUser] = await db('tenant_users')
+    .insert({
+      tenant_id: TENANT_ID,
+      email: TENANT_USER_EMAIL,
+      password_hash: tenantUserPasswordHash,
+      name: TENANT_USER_NAME,
+      role: 'OWNER',
+      is_active: true,
+    })
+    .returning(['id']);
+
+  // ─── Proxy numbers + Redis pool ─────────────────────────────────────────────
+  // +2348000000001 through +2348000000010 (E.164: +234 + 8000000 + 3-digit suffix)
+  const cleanNumbers = Array.from({ length: PROXY_COUNT }, (_, idx) => {
+    const suffix = (idx + 1).toString().padStart(3, '0');
+    return `+2348000000${suffix}`;
   });
 
-  // Proxy numbers
-  logger.info({ count: PROXY_COUNT }, 'dev-seed: creating proxy numbers');
-  const numbers: string[] = [];
-  for (let i = 0; i < PROXY_COUNT; i++) {
-    numbers.push(`${PROXY_PREFIX}${i}`);
-  }
   await db('proxy_numbers').insert(
-    numbers.map((n) => ({
-      number: n,
-      region: REGION,
-      provider: PROVIDER,
+    cleanNumbers.map((number) => ({
+      number,
+      region: PROXY_REGION,
+      provider: PROXY_PROVIDER,
       status: 'AVAILABLE',
     })),
   );
 
-  // Populate Redis available pool
-  try {
-    const poolKey = `pool:${REGION}:AFRICASTALKING:available`;
-    const altPoolKey = `pool:${REGION}:available`;
-    await redis.sadd(poolKey, ...numbers);
-    await redis.sadd(altPoolKey, ...numbers);
-    for (const n of numbers) {
-      await redis.set(`proxy:${n}:region`, REGION);
-      await redis.set(`proxy:${n}:provider`, PROVIDER);
-    }
-  } catch (err) {
-    logger.warn({ err }, 'dev-seed: redis pool populate failed (continuing)');
-  }
+  // Populate Redis pool set (the call-router + number-pool read from this)
+  await redis.sadd(`pool:${PROXY_REGION}:available`, ...cleanNumbers);
+  await redis.sadd(`pool:${PROXY_REGION}:${PROXY_PROVIDER}:available`, ...cleanNumbers);
 
-  // Operator — insert only if not exists
-  const existingOp = await db('operators').where({ email: OPERATOR_EMAIL }).first('id');
-  if (!existingOp) {
-    logger.info({ email: OPERATOR_EMAIL }, 'dev-seed: creating root operator');
-    const opPasswordHash = await bcrypt.hash(OPERATOR_PASSWORD, BCRYPT_ROUNDS);
-    await db('operators').insert({
-      email: OPERATOR_EMAIL,
-      password_hash: opPasswordHash,
+  // ─── Operator (ROOT) ────────────────────────────────────────────────────────
+  const operatorPasswordHash = await bcrypt.hash(OPERATOR_PASSWORD, 10);
+  const existingOp = await db('operators').where({ email: OPERATOR_EMAIL }).first();
+  let operatorId: string;
+  if (existingOp) {
+    operatorId = existingOp.id;
+    await db('operators').where({ id: operatorId }).update({
+      password_hash: operatorPasswordHash,
       name: OPERATOR_NAME,
       role: 'ROOT',
       is_active: true,
     });
   } else {
-    logger.info({ email: OPERATOR_EMAIL }, 'dev-seed: operator exists, skipping');
+    const [op] = await db('operators')
+      .insert({
+        email: OPERATOR_EMAIL,
+        password_hash: operatorPasswordHash,
+        name: OPERATOR_NAME,
+        role: 'ROOT',
+        is_active: true,
+      })
+      .returning(['id']);
+    operatorId = op.id;
   }
 
-  logger.info(
+  // ─── Consent audit_log entries ──────────────────────────────────────────────
+  await db('audit_log').insert([
     {
-      tenantId: TENANT_ID,
-      apiKey: DEV_API_KEY,
-      apiSecret: DEV_API_SECRET,
-      tenantUserEmail: TENANT_USER_EMAIL,
-      tenantUserPassword: TENANT_USER_PASSWORD,
-      operatorEmail: OPERATOR_EMAIL,
-      operatorPassword: OPERATOR_PASSWORD,
-      proxyCount: PROXY_COUNT,
-      region: REGION,
+      actor_type: 'tenant',
+      actor_id: tenantUser.id,
+      action: 'consent.accepted',
+      resource_type: 'tenant',
+      resource_id: TENANT_ID,
+      details: JSON.stringify({
+        document: 'terms_of_service',
+        version: '2026-01-01',
+        acceptedAt: new Date().toISOString(),
+      }),
     },
-    'dev-seed: complete',
-  );
+    {
+      actor_type: 'tenant',
+      actor_id: tenantUser.id,
+      action: 'consent.accepted',
+      resource_type: 'tenant',
+      resource_id: TENANT_ID,
+      details: JSON.stringify({
+        document: 'ndpr_dpa',
+        version: '2026-01-01',
+        acceptedAt: new Date().toISOString(),
+        scope: 'Phone-number masking + call recording with consent prompt',
+      }),
+    },
+    {
+      actor_type: 'tenant',
+      actor_id: tenantUser.id,
+      action: 'consent.accepted',
+      resource_type: 'tenant',
+      resource_id: TENANT_ID,
+      details: JSON.stringify({
+        document: 'ncc_type_approval_acknowledgement',
+        version: '2026-01-01',
+        acceptedAt: new Date().toISOString(),
+        cpaasProvider: 'Africa\'s Talking',
+      }),
+    },
+  ]);
+
+  // ─── Console summary ────────────────────────────────────────────────────────
+  /* eslint-disable no-console */
+  console.log('\n========== Relavoi dev seed complete ==========');
+  console.log(`  Tenant:           ${TENANT_NAME} (${TENANT_ID})`);
+  console.log(`  Workspace slug:   chowdeck`);
+  console.log(`  Tier:             GROWTH`);
+  console.log(`  API Key:          ${DEV_API_KEY}`);
+  console.log(`  API Secret:       ${DEV_API_SECRET}`);
+  console.log('');
+  console.log(`  Dashboard login:  ${TENANT_USER_EMAIL} / ${TENANT_USER_PASSWORD}`);
+  console.log(`  Admin login:      ${OPERATOR_EMAIL} / ${OPERATOR_PASSWORD}`);
+  console.log('');
+  console.log(`  Proxy numbers:    ${cleanNumbers.length} (${cleanNumbers[0]} … ${cleanNumbers[cleanNumbers.length - 1]})`);
+  console.log(`  Region/Provider:  ${PROXY_REGION} / ${PROXY_PROVIDER}`);
+  console.log(`  Consent entries:  3 (ToS, NDPR DPA, NCC type-approval)`);
+  console.log('===============================================\n');
+  /* eslint-enable no-console */
+
+  logger.info({ tenantId: TENANT_ID, tenantName: TENANT_NAME }, 'dev seed complete');
 }

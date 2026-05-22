@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: relavoi-postgres-full
+    environment:
+      POSTGRES_USER: relavoi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relavoi_dev}
+      POSTGRES_DB: relavoi
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata-full:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relavoi -d relavoi"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: relavoi-redis-full
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata-full:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: relavoi-api:latest
+    container_name: relavoi-migrate
+    command: ["node", "dist/scripts/run-migrations.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: "postgresql://relavoi:${POSTGRES_PASSWORD:-relavoi_dev}@postgres:5432/relavoi"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PREFIX: "relavoi:"
+      JWT_SECRET: "${JWT_SECRET}"
+      ENCRYPTION_MASTER_KEY: "${ENCRYPTION_MASTER_KEY}"
+      AT_API_KEY: "${AT_API_KEY}"
+      AT_USERNAME: "${AT_USERNAME:-sandbox}"
+      WEBHOOK_BASE_URL: "${WEBHOOK_BASE_URL:-https://api.relavoi.com}"
+    restart: "no"
+
+  api:
+    image: relavoi-api:latest
+    container_name: relavoi-api-full
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: "postgresql://relavoi:${POSTGRES_PASSWORD:-relavoi_dev}@postgres:5432/relavoi"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_PREFIX: "relavoi:"
+      JWT_SECRET: "${JWT_SECRET}"
+      ENCRYPTION_MASTER_KEY: "${ENCRYPTION_MASTER_KEY}"
+      AT_API_KEY: "${AT_API_KEY}"
+      AT_USERNAME: "${AT_USERNAME:-sandbox}"
+      WEBHOOK_BASE_URL: "${WEBHOOK_BASE_URL:-https://api.relavoi.com}"
+    restart: unless-stopped
+
+volumes:
+  pgdata-full:
+  redisdata-full:

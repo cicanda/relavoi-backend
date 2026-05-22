@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Lint, Build, Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relavoi
+          POSTGRES_PASSWORD: relavoi_dev
+          POSTGRES_DB: relavoi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relavoi -d relavoi"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      LOG_LEVEL: fatal
+      DATABASE_URL: postgres://relavoi:relavoi_dev@localhost:5432/relavoi
+      REDIS_URL: redis://localhost:6379
+      REDIS_PREFIX: "relavoi-ci:"
+      JWT_SECRET: ci-jwt-secret-must-be-at-least-32-characters-long-aaaa
+      ENCRYPTION_MASTER_KEY: ci-encryption-master-key-must-be-at-least-64-characters-long-for-validation-aaaaaaaa
+      AT_API_KEY: ci-at-api-key
+      AT_USERNAME: sandbox
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Migrate (integration prep)
+        run: npm run migrate
+
+      - name: Seed (integration prep)
+        run: npm run seed
+
+      - name: Integration tests
+        run: npm run test:integration
+
+  docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f docker/Dockerfile -t relavoi-api:${{ github.sha }} .

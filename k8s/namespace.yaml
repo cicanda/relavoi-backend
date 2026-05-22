@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relavoi
+  labels:
+    name: relavoi
+    app.kubernetes.io/part-of: relavoi

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: relavoi-api
+  namespace: relavoi
+  labels:
+    app: relavoi-api
+    component: api
+spec:
+  type: ClusterIP
+  selector:
+    app: relavoi-api
+    component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

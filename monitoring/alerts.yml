@@ -1,0 +1,68 @@
+groups:
+  - name: relavoi-platform
+    interval: 30s
+    rules:
+      # High error rate across HTTP surface
+      - alert: HighHttpErrorRate
+        expr: |
+          (sum(rate(http_requests_total{status_code=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m]))) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 5xx error rate above 1% for 5 minutes"
+          description: "Error ratio is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      # Slow call routing (critical-path latency)
+      - alert: SlowCallRouting
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(call_routing_duration_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Call routing p99 > 500ms"
+          description: "Webhook -> routing response p99 is {{ $value }}s; SLA is 500ms."
+
+      # Webhook DLQ depth
+      - alert: WebhookDlqDepthHigh
+        expr: webhook_dlq_depth > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook DLQ depth > 10"
+          description: "{{ $value }} webhook events have not been processed successfully."
+
+      # Pool utilization
+      - alert: NumberPoolUtilizationHigh
+        expr: number_pool_utilization_percent > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pool utilization > 80% in {{ $labels.region }}"
+          description: "Auto-provision threshold reached. Consider provisioning more numbers."
+
+      # Circuit breaker stuck open
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN for {{ $labels.provider }}"
+          description: "Provider {{ $labels.provider }} has been in OPEN state for more than 5 minutes."
+
+      # Pool depletion (defensive)
+      - alert: NumberPoolNearlyEmpty
+        expr: number_pool_available < 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Number pool {{ $labels.region }}/{{ $labels.provider }} nearly empty"
+          description: "Only {{ $value }} numbers available."

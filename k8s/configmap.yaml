@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relavoi-config
+  namespace: relavoi
+data:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  REDIS_PREFIX: "relavoi:"
+  WEBHOOK_BASE_URL: "https://api.relavoi.com"
+  WEBHOOK_HMAC_ALGO: "sha256"
+
+  # Number pool
+  POOL_COOLDOWN_MINUTES: "5"
+  POOL_LOW_THRESHOLD_PERCENT: "20"
+  POOL_AUTO_PROVISION_THRESHOLD_PERCENT: "20"
+
+  # Session
+  SESSION_DEFAULT_GRACE_PERIOD_MINUTES: "15"
+  SESSION_DEFAULT_MAX_DURATION_MINUTES: "120"
+  SESSION_EXPIRY_CHECK_INTERVAL_SECONDS: "30"
+
+  # Circuit breaker
+  CB_FAILURE_THRESHOLD: "5"
+  CB_ERROR_RATE_THRESHOLD: "0.1"
+  CB_ERROR_RATE_WINDOW_SECONDS: "120"
+  CB_HEALTH_CHECK_INTERVAL_SECONDS: "30"
+  CB_RECOVERY_CHECK_COUNT: "5"
+  CB_HALF_OPEN_TRAFFIC_PERCENT: "10"
+
+  # Africa's Talking
+  AT_USERNAME: "relavoi"
+  AT_ENVIRONMENT: "production"

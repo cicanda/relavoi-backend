@@ -7,6 +7,7 @@ export type BillingMetric =
   | 'call_minute'
   | 'sms_sent'
   | 'sms_received'
+  | 'recording_minute'
   | 'number_rental';
 
 export interface UsageSummary {
@@ -20,9 +21,10 @@ export interface UsageSummary {
 export interface UsageEventRow {
   id: string;
   tenant_id: string;
+  billing_period_id: string;
   metric: BillingMetric;
   quantity: number;
-  created_at: Date;
+  recorded_at: Date;
 }
 
 const ALL_METRICS: BillingMetric[] = [
@@ -30,6 +32,7 @@ const ALL_METRICS: BillingMetric[] = [
   'call_minute',
   'sms_sent',
   'sms_received',
+  'recording_minute',
   'number_rental',
 ];
 
@@ -55,16 +58,50 @@ export class BillingManager {
       if (!Number.isFinite(quantity) || quantity <= 0) return;
 
       const db = getDb();
+      // billing_period_id is NOT NULL in the schema. Resolve (or open) the
+      // tenant's active period inside the same transaction so concurrent
+      // callers can't double-create one.
+      const billingPeriodId = await this.resolveActiveBillingPeriod(tenantId);
       await db('usage_records').insert({
         id: randomUUID(),
         tenant_id: tenantId,
+        billing_period_id: billingPeriodId,
         metric,
         quantity,
-        created_at: new Date(),
+        recorded_at: new Date(),
       });
     } catch (err) {
       logger.warn({ err, tenantId, metric }, 'BillingManager.recordUsage failed (swallowed)');
     }
+  }
+
+  /**
+   * Look up the tenant's current ACTIVE billing period, opening a fresh one
+   * (calendar-month-aligned) if none exists.
+   */
+  private async resolveActiveBillingPeriod(tenantId: string): Promise<string> {
+    const db = getDb();
+    const existing = await db('billing_periods')
+      .where({ tenant_id: tenantId, status: 'ACTIVE' })
+      .orderBy('period_start', 'desc')
+      .first();
+    if (existing) return existing.id as string;
+
+    const now = new Date();
+    const periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const periodEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const [row] = await db('billing_periods')
+      .insert({
+        id: randomUUID(),
+        tenant_id: tenantId,
+        period_start: periodStart,
+        period_end: periodEnd,
+        status: 'ACTIVE',
+      })
+      .returning(['id']);
+    // Best-effort: point the tenant at this period (ignore conflict if another concurrent caller already did).
+    await db('tenants').where({ id: tenantId }).update({ current_billing_period_id: row.id }).catch(() => {});
+    return row.id as string;
   }
 
   async getUsageSummary(
@@ -82,8 +119,8 @@ export class BillingManager {
         .sum<{ metric: BillingMetric; sum: string }[]>('quantity as sum')
         .count<{ metric: BillingMetric; sum: string; count: string }[]>('* as count')
         .where({ tenant_id: tenantId })
-        .andWhere('created_at', '>=', periodStart)
-        .andWhere('created_at', '<', periodEnd)
+        .andWhere('recorded_at', '>=', periodStart)
+        .andWhere('recorded_at', '<', periodEnd)
         .groupBy('metric');
 
       for (const r of rows as Array<{ metric: BillingMetric; sum: string; count: string }>) {
@@ -112,9 +149,9 @@ export class BillingManager {
       const db = getDb();
       const query = db<UsageEventRow>('usage_records')
         .where({ tenant_id: tenantId })
-        .andWhere('created_at', '>=', periodStart)
-        .andWhere('created_at', '<', periodEnd)
-        .orderBy('created_at', 'desc')
+        .andWhere('recorded_at', '>=', periodStart)
+        .andWhere('recorded_at', '<', periodEnd)
+        .orderBy('recorded_at', 'desc')
         .limit(Math.min(Math.max(limit, 1), 1000))
         .offset(Math.max(offset, 0));
       if (metric) query.andWhere({ metric });

@@ -21,7 +21,7 @@ import { numberPoolAvailable, numberPoolUtilization } from '../utils/metrics';
  * EVAL/EVALSHA automatically, so the Lua script must not redo that.
  */
 
-const DEFAULT_REGION = 'NG';
+const DEFAULT_REGION = 'lagos';
 
 /**
  * Atomic allocation script.
@@ -38,6 +38,10 @@ const DEFAULT_REGION = 'NG';
  *
  * Returns: allocated proxy_number string, or "" if none available without overlap.
  */
+// NOTE: ARGV[5] = keyPrefix. ioredis auto-prefixes keys passed via KEYS[] but
+// NOT dynamic keys constructed inside Lua. We pass the prefix explicitly and
+// prepend it to every dynamic key so JS-side reads (which DO get prefixed)
+// hit the same slots.
 const ALLOCATE_SCRIPT = `
 local pool_avail = KEYS[1]
 local pool_in_use = KEYS[2]
@@ -45,12 +49,12 @@ local party_a = ARGV[1]
 local party_b = ARGV[2]
 local sid = ARGV[3]
 local max_attempts = tonumber(ARGV[4]) or 8
+local prefix = ARGV[5] or ''
 
 local tried = {}
 for attempt = 1, max_attempts do
   local candidate = redis.call('SRANDMEMBER', pool_avail)
   if not candidate then
-    -- Pool is empty. We may also need to scan in_use numbers for reuse.
     break
   end
   if tried[candidate] then
@@ -58,49 +62,47 @@ for attempt = 1, max_attempts do
   else
     tried[candidate] = true
     local overlap = false
-    local existing = redis.call('SMEMBERS', 'proxy:' .. candidate .. ':sessions')
+    local existing = redis.call('SMEMBERS', prefix .. 'proxy:' .. candidate .. ':sessions')
     for _, esid in ipairs(existing) do
-      local pa = redis.call('HGET', 'session:' .. esid, 'party_a_hash')
-      local pb = redis.call('HGET', 'session:' .. esid, 'party_b_hash')
+      local pa = redis.call('HGET', prefix .. 'session:' .. esid, 'party_a_hash')
+      local pb = redis.call('HGET', prefix .. 'session:' .. esid, 'party_b_hash')
       if pa == party_a or pa == party_b or pb == party_a or pb == party_b then
         overlap = true
         break
       end
     end
     if not overlap then
-      -- Reserve: if this number has no other sessions, move to in_use.
-      local sess_count = redis.call('SCARD', 'proxy:' .. candidate .. ':sessions')
+      local sess_count = redis.call('SCARD', prefix .. 'proxy:' .. candidate .. ':sessions')
       if sess_count == 0 then
         redis.call('SREM', pool_avail, candidate)
         redis.call('SADD', pool_in_use, candidate)
       end
-      redis.call('SADD', 'proxy:' .. candidate .. ':sessions', sid)
-      redis.call('SADD', 'phone:' .. party_a .. ':sessions', sid)
-      redis.call('SADD', 'phone:' .. party_b .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'proxy:' .. candidate .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'phone:' .. party_a .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'phone:' .. party_b .. ':sessions', sid)
       return candidate
     end
   end
 end
 
--- Fallback: scan in_use numbers, which may already have sessions but without overlap.
 local in_use_members = redis.call('SMEMBERS', pool_in_use)
 for _, candidate in ipairs(in_use_members) do
   if not tried[candidate] then
     tried[candidate] = true
     local overlap = false
-    local existing = redis.call('SMEMBERS', 'proxy:' .. candidate .. ':sessions')
+    local existing = redis.call('SMEMBERS', prefix .. 'proxy:' .. candidate .. ':sessions')
     for _, esid in ipairs(existing) do
-      local pa = redis.call('HGET', 'session:' .. esid, 'party_a_hash')
-      local pb = redis.call('HGET', 'session:' .. esid, 'party_b_hash')
+      local pa = redis.call('HGET', prefix .. 'session:' .. esid, 'party_a_hash')
+      local pb = redis.call('HGET', prefix .. 'session:' .. esid, 'party_b_hash')
       if pa == party_a or pa == party_b or pb == party_a or pb == party_b then
         overlap = true
         break
       end
     end
     if not overlap then
-      redis.call('SADD', 'proxy:' .. candidate .. ':sessions', sid)
-      redis.call('SADD', 'phone:' .. party_a .. ':sessions', sid)
-      redis.call('SADD', 'phone:' .. party_b .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'proxy:' .. candidate .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'phone:' .. party_a .. ':sessions', sid)
+      redis.call('SADD', prefix .. 'phone:' .. party_b .. ':sessions', sid)
       return candidate
     end
   end
@@ -123,6 +125,7 @@ return ""
  *
  * Returns: 1 if number was returned to cooldown, 0 if still in use.
  */
+// ARGV[4] = keyPrefix (see ALLOCATE_SCRIPT note about dynamic-key prefixing).
 const RELEASE_SCRIPT = `
 local pool_avail = KEYS[1]
 local pool_in_use = KEYS[2]
@@ -130,9 +133,10 @@ local pool_cd = KEYS[3]
 local proxy = ARGV[1]
 local sid = ARGV[2]
 local cd_until = tonumber(ARGV[3])
+local prefix = ARGV[4] or ''
 
-redis.call('SREM', 'proxy:' .. proxy .. ':sessions', sid)
-local remaining = redis.call('SCARD', 'proxy:' .. proxy .. ':sessions')
+redis.call('SREM', prefix .. 'proxy:' .. proxy .. ':sessions', sid)
+local remaining = redis.call('SCARD', prefix .. 'proxy:' .. proxy .. ':sessions')
 if remaining == 0 then
   redis.call('SREM', pool_in_use, proxy)
   redis.call('SREM', pool_avail, proxy)
@@ -187,6 +191,7 @@ export class NumberPool {
         args.partyBHash,
         args.sessionId,
         '8',
+        config.REDIS_PREFIX,
       )) as string;
 
       if (!result || result === '') {
@@ -225,6 +230,7 @@ export class NumberPool {
         args.proxyNumber,
         args.sessionId,
         String(cooldownUntilMs),
+        config.REDIS_PREFIX,
       )) as number;
 
       // Persist DB cooldown timestamp best-effort

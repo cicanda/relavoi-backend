@@ -50,25 +50,28 @@ const callListQuerySchema = z.object({
 });
 
 // ─── DTOs ───────────────────────────────────────────────────────────────────────
+// SessionManager returns camelCase Session objects, but direct DB rows are snake_case.
+// This DTO accepts either shape — pull the first non-undefined value.
 function sessionDto(s: any): Record<string, unknown> {
+  const pick = (camel: string, snake: string) => s[camel] !== undefined ? s[camel] : s[snake];
   return {
     id: s.id,
-    tenantId: s.tenant_id,
-    proxyNumber: s.proxy_number,
+    tenantId: pick('tenantId', 'tenant_id'),
+    proxyNumber: pick('proxyNumber', 'proxy_number'),
     state: s.state,
-    directionMode: s.direction_mode,
+    directionMode: pick('directionMode', 'direction_mode'),
     metadata: s.metadata ?? {},
-    gracePeriodMinutes: s.grace_period_min,
-    maxDurationMinutes: s.max_duration_min,
-    recordingEnabled: s.recording_enabled,
-    consentPrompt: s.consent_prompt,
-    expiresAt: s.expires_at,
-    createdAt: s.created_at,
-    activatedAt: s.activated_at,
-    endedAt: s.ended_at,
-    expiredAt: s.expired_at,
-    callCount: s.call_count,
-    lastCallAt: s.last_call_at,
+    gracePeriodMinutes: pick('gracePeriodMin', 'grace_period_min'),
+    maxDurationMinutes: pick('maxDurationMin', 'max_duration_min'),
+    recordingEnabled: pick('recordingEnabled', 'recording_enabled'),
+    consentPrompt: pick('consentPrompt', 'consent_prompt'),
+    expiresAt: pick('expiresAt', 'expires_at'),
+    createdAt: pick('createdAt', 'created_at'),
+    activatedAt: pick('activatedAt', 'activated_at'),
+    endedAt: pick('endedAt', 'ended_at'),
+    expiredAt: pick('expiredAt', 'expired_at'),
+    callCount: pick('callCount', 'call_count'),
+    lastCallAt: pick('lastCallAt', 'last_call_at'),
   };
 }
 

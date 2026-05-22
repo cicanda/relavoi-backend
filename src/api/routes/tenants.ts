@@ -22,6 +22,10 @@ function generateApiSecret(): string {
   return `rs_${crypto.randomBytes(32).toString('hex')}`;
 }
 
+function sha256(s: string): string {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
 function generateTempPassword(): string {
   // 16 chars from base64url
   return crypto.randomBytes(12).toString('base64url');
@@ -105,25 +109,11 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const db = getDb();
-    const tenants = await db('tenants').select('*');
 
-    // We need to find the row whose api_key matches via bcrypt. Since bcrypt
-    // hashes are not reversible, iterate. For production scale this would use
-    // a separate lookup column (sha256 of api_key) — out of scope for MVP.
-    let matched: Record<string, unknown> | null = null;
-    for (const t of tenants) {
-      try {
-        const keyOk = await bcrypt.compare(parsed.data.apiKey, t.api_key_hash);
-        if (!keyOk) continue;
-        const secretOk = await bcrypt.compare(parsed.data.apiSecret, t.api_secret_hash);
-        if (secretOk) {
-          matched = t;
-          break;
-        }
-      } catch {
-        // Skip rows with malformed hashes
-      }
-    }
+    // api_key_hash is SHA-256(apiKey) — index lookup, O(1).
+    // api_secret_hash is bcrypt(apiSecret) — verified after the row is located.
+    const apiKeyHash = sha256(parsed.data.apiKey);
+    const matched = await db('tenants').where({ api_key_hash: apiKeyHash }).first();
 
     if (!matched) {
       return reply
@@ -132,12 +122,22 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
         .send(rfc7807('unauthorized', 'Unauthorized', 401, 'Invalid API credentials.'));
     }
 
-    if (matched.status && matched.status !== 'ACTIVE') {
-      return reply
-        .status(403)
-        .type('application/problem+json')
-        .send(rfc7807('forbidden', 'Forbidden', 403, `Tenant status is ${matched.status as string}.`));
+    let secretOk = false;
+    try {
+      secretOk = await bcrypt.compare(parsed.data.apiSecret, matched.api_secret_hash);
+    } catch {
+      secretOk = false;
     }
+    if (!secretOk) {
+      return reply
+        .status(401)
+        .type('application/problem+json')
+        .send(rfc7807('unauthorized', 'Unauthorized', 401, 'Invalid API credentials.'));
+    }
+
+    // Fire-and-forget last-used timestamp; never block auth on this
+    db('tenants').where({ id: matched.id }).update({ api_key_last_used_at: new Date() })
+      .catch((err) => logger.warn({ err, tenantId: matched.id }, 'failed to update api_key_last_used_at'));
 
     const accessToken = app.jwt.sign(
       { tenantId: matched.id as string, tier: (matched.tier as string) ?? 'STARTER' },
@@ -175,7 +175,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     const apiKey = generateApiKey();
     const apiSecret = generateApiSecret();
 
-    const apiKeyHash = await bcrypt.hash(apiKey, BCRYPT_COST);
+    const apiKeyHash = sha256(apiKey);
     const apiSecretHash = await bcrypt.hash(apiSecret, BCRYPT_COST);
     const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
 
@@ -190,6 +190,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
             api_key_hash: apiKeyHash,
             api_secret_hash: apiSecretHash,
             tier: 'STARTER',
+            billing_email: email.toLowerCase(),
           })
           .returning(['id']);
         tenantId = tenant.id;
@@ -199,8 +200,9 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
             tenant_id: tenantId,
             email: email.toLowerCase(),
             password_hash: passwordHash,
+            name: email.split('@')[0],
             role: 'OWNER',
-            status: 'ACTIVE',
+            is_active: true,
           })
           .returning(['id']);
         userId = user.id;
@@ -352,9 +354,9 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
           tenant_id: tenant.id,
           email: email.toLowerCase(),
           password_hash: passwordHash,
+          name: email.split('@')[0],
           role,
-          status: 'PENDING',
-          must_change_password: true,
+          is_active: true,
         })
         .returning(['id']);
 
@@ -403,10 +405,9 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       }
       const newHash = await bcrypt.hash(parsed.data.newPassword, BCRYPT_COST);
       await db('tenant_users')
-        .where({ id: req.user.id })
+        .where({ id: req.user!.id })
         .update({
           password_hash: newHash,
-          must_change_password: false,
           updated_at: new Date(),
         });
       return reply.status(204).send();
@@ -421,7 +422,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       const tenant = req.tenant!;
       const apiKey = generateApiKey();
       const apiSecret = generateApiSecret();
-      const apiKeyHash = await bcrypt.hash(apiKey, BCRYPT_COST);
+      const apiKeyHash = sha256(apiKey);
       const apiSecretHash = await bcrypt.hash(apiSecret, BCRYPT_COST);
 
       const db = getDb();
@@ -450,7 +451,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
         .send(rfc7807('not-found', 'Not Found', 404, 'Tenant not found.'));
     }
     const body: Record<string, unknown> = { tenant: mapTenantDto(t) };
-    if (req.user) {
+    if (req.user && req.user.id) {
       const u = await db('tenant_users').where({ id: req.user.id }).first();
       if (u) {
         body.user = {

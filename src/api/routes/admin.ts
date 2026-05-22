@@ -424,7 +424,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get('/admin/operators', { preHandler: [adminAuthenticate] }, async (_req, reply) => {
     const db = getDb();
     const rows = await db('operators')
-      .select('id', 'email', 'name', 'role', 'status', 'created_at', 'last_login_at')
+      .select('id', 'email', 'name', 'role', 'is_active', 'created_at', 'last_login_at')
       .orderBy('created_at', 'desc');
     return reply.send({ data: rows.map(operatorDto) });
   });
@@ -456,9 +456,9 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
           name: parsed.data.name,
           role: parsed.data.role,
           password_hash: passwordHash,
-          status: 'ACTIVE',
+          is_active: true,
         })
-        .returning(['id', 'email', 'name', 'role', 'status', 'created_at', 'last_login_at']);
+        .returning(['id', 'email', 'name', 'role', 'is_active', 'created_at', 'last_login_at']);
 
       await getAuditLogger()
         .log({

@@ -20,6 +20,11 @@ const eventsQuerySchema = periodSchema.extend({
   offset: z.coerce.number().int().nonnegative().default(0),
 });
 
+const periodsListSchema = z.object({
+  limit: z.coerce.number().int().positive().max(24).default(12),
+  after: z.string().uuid().optional(),
+});
+
 export async function billingRoutes(app: FastifyInstance): Promise<void> {
   // GET /billing/usage
   app.get('/billing/usage', { preHandler: [authenticate, tierRateLimit] }, async (req, reply) => {
@@ -58,6 +63,57 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
       parsed.data.offset,
     );
     return reply.send({ events: result });
+  });
+
+  // GET /billing/periods — list the tenant's billing periods, newest first.
+  // Cursor pagination by id: pass the last row's id as `after` to fetch older periods.
+  app.get('/billing/periods', { preHandler: [authenticate, tierRateLimit] }, async (req, reply) => {
+    const parsed = periodsListSchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .type('application/problem+json')
+        .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+    }
+    const tenant = req.tenant!;
+    const db = getDb();
+    const q = db('billing_periods')
+      .where({ tenant_id: tenant.id })
+      .orderBy('period_start', 'desc')
+      .limit(parsed.data.limit);
+    if (parsed.data.after) {
+      // Periods are ordered by start date but the cursor is the id of the last row
+      // we returned. Fetch periods strictly older than that row's start_date.
+      const cursorRow = await db('billing_periods')
+        .where({ id: parsed.data.after, tenant_id: tenant.id })
+        .first('period_start');
+      if (cursorRow) {
+        q.andWhere('period_start', '<', cursorRow.period_start);
+      }
+    }
+    const rows: Array<{
+      id: string;
+      period_start: Date;
+      period_end: Date;
+      status: string;
+      created_at: Date;
+      closed_at: Date | null;
+    }> = await q;
+    const data = rows.map((r) => ({
+      id: r.id,
+      periodStart: r.period_start,
+      periodEnd: r.period_end,
+      status: r.status,
+      createdAt: r.created_at,
+      closedAt: r.closed_at,
+    }));
+    return reply.send({
+      data,
+      pagination: {
+        count: data.length,
+        after: data.length === parsed.data.limit ? data[data.length - 1].id : null,
+      },
+    });
   });
 
   // GET /billing/pricing — returns tier_pricing rows (public-ish)

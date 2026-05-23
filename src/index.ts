@@ -14,11 +14,13 @@ async function buildApp() {
   });
 
   // ─── Plugins ────────────────────────────────────────────────────────────────
+  // CORS — comma-separated origins via CORS_ORIGINS env var. Falls back to the
+  // standard local dev frontends (dashboard :3001, admin :3003) when unset.
+  const corsOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+    : ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'];
   await app.register(import('@fastify/cors'), {
-    origin:
-      config.NODE_ENV === 'development'
-        ? ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003']
-        : ['https://app.relavoi.com', 'https://admin.relavoi.com'],
+    origin: corsOrigins,
     credentials: true,
   });
 

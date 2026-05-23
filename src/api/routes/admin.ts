@@ -64,6 +64,22 @@ const auditQuery = z.object({
   after: z.string().optional(),
 });
 
+// E.164: + then 7-15 digits, first digit non-zero.
+const e164Re = /^\+[1-9]\d{6,14}$/;
+
+const quarantineBodySchema = z.object({
+  number: z.string().regex(e164Re, 'number must be E.164 (e.g. +2348012345678)'),
+  reason: z.string().min(3).max(500),
+});
+
+const releaseBodySchema = z.object({
+  number: z.string().regex(e164Re, 'number must be E.164 (e.g. +2348012345678)'),
+});
+
+const operatorIdParamsSchema = z.object({
+  id: z.string().uuid(),
+});
+
 // ─── DTOs ───────────────────────────────────────────────────────────────────────
 function tenantSummaryDto(t: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -114,11 +130,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         .type('application/problem+json')
         .send(rfc7807('unauthorized', 'Unauthorized', 401, 'Invalid credentials.'));
     }
-    if (op.status && op.status !== 'ACTIVE') {
+    if (op.is_active === false) {
+      // Backend gating for the soft-deactivation done by DELETE /admin/operators/:id.
+      // A deactivated operator must not be able to mint a fresh JWT.
       return reply
-        .status(403)
+        .status(401)
         .type('application/problem+json')
-        .send(rfc7807('forbidden', 'Forbidden', 403, `Operator status is ${op.status}.`));
+        .send(rfc7807('unauthorized', 'Unauthorized', 401, 'Account is deactivated.'));
     }
     await db('operators')
       .where({ id: op.id })
@@ -420,6 +438,133 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  // ─── POST /admin/pool/quarantine (ROOT|SRE) ───────────────────────────────────
+  app.post(
+    '/admin/pool/quarantine',
+    { preHandler: [adminAuthenticate, requireRole('ROOT', 'SRE')] },
+    async (req, reply) => {
+      const parsed = quarantineBodySchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+      const { number, reason } = parsed.data;
+      const db = getDb();
+      const row = await db('proxy_numbers').where({ number }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Number not found in pool'));
+      }
+      if (row.status === 'QUARANTINED') {
+        return reply
+          .status(409)
+          .type('application/problem+json')
+          .send(rfc7807('conflict', 'Conflict', 409, 'Number is already quarantined'));
+      }
+      const previousStatus = row.status as string;
+      const region = (row.region as string | null) ?? 'lagos';
+      const provider = (row.provider as string | null) ?? 'AFRICASTALKING';
+
+      await db('proxy_numbers').where({ number }).update({ status: 'QUARANTINED' });
+
+      // Yank from the Redis available pool so it can't be allocated again. Active
+      // sessions on this number keep their session:{id} hash and the proxy:{n}:sessions
+      // mapping untouched — they finish naturally, but no new session will pick it.
+      const redis = getRedis();
+      try {
+        await Promise.all([
+          redis.srem(`pool:${region}:available`, number),
+          redis.srem(`pool:${region}:${provider}:available`, number),
+          redis.srem(`pool:${region}:in_use`, number),
+        ]);
+      } catch (err) {
+        logger.warn({ err, number }, 'quarantine: redis pool cleanup failed (non-fatal)');
+      }
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'pool.number_quarantined',
+          resourceType: 'proxy_number',
+          resourceId: number,
+          metadata: { reason, previousStatus },
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      return reply.send({ success: true, number, previousStatus, reason });
+    },
+  );
+
+  // ─── POST /admin/pool/release (ROOT|SRE) ──────────────────────────────────────
+  app.post(
+    '/admin/pool/release',
+    { preHandler: [adminAuthenticate, requireRole('ROOT', 'SRE')] },
+    async (req, reply) => {
+      const parsed = releaseBodySchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+      const { number } = parsed.data;
+      const db = getDb();
+      const row = await db('proxy_numbers').where({ number }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Number not found in pool'));
+      }
+      if (row.status !== 'QUARANTINED') {
+        return reply
+          .status(409)
+          .type('application/problem+json')
+          .send(
+            rfc7807(
+              'conflict',
+              'Conflict',
+              409,
+              `Only quarantined numbers can be released. Current status: ${row.status}`,
+            ),
+          );
+      }
+      const region = (row.region as string | null) ?? 'lagos';
+      const provider = (row.provider as string | null) ?? 'AFRICASTALKING';
+
+      await db('proxy_numbers')
+        .where({ number })
+        .update({ status: 'AVAILABLE', cooldown_until: null });
+
+      const redis = getRedis();
+      try {
+        await Promise.all([
+          redis.sadd(`pool:${region}:available`, number),
+          redis.sadd(`pool:${region}:${provider}:available`, number),
+        ]);
+      } catch (err) {
+        logger.warn({ err, number }, 'release: redis pool re-add failed (non-fatal)');
+      }
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'pool.number_released',
+          resourceType: 'proxy_number',
+          resourceId: number,
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      return reply.send({ success: true, number });
+    },
+  );
+
   // ─── GET /admin/operators ─────────────────────────────────────────────────────
   app.get('/admin/operators', { preHandler: [adminAuthenticate] }, async (_req, reply) => {
     const db = getDb();
@@ -472,6 +617,60 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         .catch((err) => logger.warn({ err }, 'audit log failed'));
 
       return reply.status(201).send(operatorDto(created));
+    },
+  );
+
+  // ─── DELETE /admin/operators/:id (ROOT) — soft-deactivate ─────────────────────
+  app.delete(
+    '/admin/operators/:id',
+    { preHandler: [adminAuthenticate, requireRole('ROOT')] },
+    async (req, reply) => {
+      const params = operatorIdParamsSchema.safeParse(req.params);
+      if (!params.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, params.error.message));
+      }
+      const { id } = params.data;
+
+      // Self-protection: a ROOT operator can't lock themselves out of the console.
+      if (id === req.operator!.id) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('self-deactivation', 'Bad Request', 400, 'Cannot deactivate your own account'));
+      }
+
+      const db = getDb();
+      const op = await db('operators').where({ id }).first();
+      if (!op) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Operator not found'));
+      }
+      if (op.is_active === false) {
+        return reply
+          .status(409)
+          .type('application/problem+json')
+          .send(rfc7807('conflict', 'Conflict', 409, 'Operator is already deactivated'));
+      }
+
+      await db('operators').where({ id }).update({ is_active: false, updated_at: new Date() });
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'operator.deactivated',
+          resourceType: 'operator',
+          resourceId: id,
+          metadata: { name: op.name, email: op.email },
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      return reply.send({ success: true, id });
     },
   );
 

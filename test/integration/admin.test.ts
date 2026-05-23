@@ -163,8 +163,73 @@ describe('ADMIN — operator console', () => {
   });
 
   // ── h ────────────────────────────────────────────────────────────────────
-  it.skip('POST /v1/admin/pool/quarantine works — quarantine endpoint not yet implemented', () => {
-    // No quarantine route exists in src/api/routes/admin.ts. Skipping until it lands.
+  it('POST /v1/admin/pool/quarantine quarantines a number', async () => {
+    const row = await db('proxy_numbers').where({ status: 'AVAILABLE' }).first();
+    expect(row, 'expected at least one AVAILABLE proxy number from the seed').toBeTruthy();
+    const number: string = row!.number;
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/pool/quarantine',
+      headers: { authorization: `Bearer ${operatorToken}` },
+      payload: { number, reason: 'Test quarantine' },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      success: boolean;
+      number: string;
+      previousStatus: string;
+      reason: string;
+    };
+    expect(body.success).toBe(true);
+    expect(body.number).toBe(number);
+    expect(body.previousStatus).toBe('AVAILABLE');
+
+    const after = await db('proxy_numbers').where({ number }).first();
+    expect(after?.status).toBe('QUARANTINED');
+
+    // Audit log captured the action.
+    const audit = await db('audit_log')
+      .where({ action: 'pool.number_quarantined', resource_id: number })
+      .first();
+    expect(audit).toBeTruthy();
+  });
+
+  // ── h2 (release follow-up) ──────────────────────────────────────────────
+  it('POST /v1/admin/pool/release releases a quarantined number', async () => {
+    const row = await db('proxy_numbers').where({ status: 'AVAILABLE' }).first();
+    expect(row).toBeTruthy();
+    const number: string = row!.number;
+
+    // Quarantine first.
+    const q = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/pool/quarantine',
+      headers: { authorization: `Bearer ${operatorToken}` },
+      payload: { number, reason: 'Release test setup' },
+    });
+    expect(q.statusCode).toBe(200);
+
+    // Now release.
+    const r = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/pool/release',
+      headers: { authorization: `Bearer ${operatorToken}` },
+      payload: { number },
+    });
+    expect(r.statusCode).toBe(200);
+    const body = r.json() as { success: boolean; number: string };
+    expect(body.success).toBe(true);
+    expect(body.number).toBe(number);
+
+    const after = await db('proxy_numbers').where({ number }).first();
+    expect(after?.status).toBe('AVAILABLE');
+
+    // Number is back in the Redis pool set.
+    const { getRedis } = await import('../../src/config/redis');
+    const region = (after?.region as string | null) ?? 'lagos';
+    const isMember = await getRedis().sismember(`pool:${region}:available`, number);
+    expect(isMember).toBe(1);
   });
 
   // ── i ────────────────────────────────────────────────────────────────────
@@ -259,9 +324,56 @@ describe('ADMIN — operator console', () => {
     expect(forbidden.statusCode).toBe(403);
   });
 
-  // ── l ────────────────────────────────────────────────────────────────────
-  it.skip('Cannot delete yourself — DELETE /v1/admin/operators/:id route not implemented', () => {
-    // No DELETE route exists in src/api/routes/admin.ts. Skipping.
+  // ── l1 ───────────────────────────────────────────────────────────────────
+  it('DELETE /v1/admin/operators/:id deactivates the operator', async () => {
+    // Seed a fresh operator we can deactivate (the ROOT test operator must stay).
+    const target = await seedOperator(db, {
+      email: `delete-target-${Date.now()}@relavoi.test`,
+      password: 'delete-me-1234',
+      name: 'Delete Target',
+      role: 'SUPPORT',
+    });
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/v1/admin/operators/${target.id}`,
+      headers: { authorization: `Bearer ${operatorToken}` },
+    });
+    expect(del.statusCode).toBe(200);
+    const body = del.json() as { success: boolean; id: string };
+    expect(body.success).toBe(true);
+    expect(body.id).toBe(target.id);
+
+    const after = await db('operators').where({ id: target.id }).first();
+    expect(after?.is_active).toBe(false);
+
+    // And the deactivated operator can no longer log in.
+    const loginRes = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/auth/login',
+      payload: { email: target.email, password: target.password },
+    });
+    expect(loginRes.statusCode).toBe(401);
+  });
+
+  // ── l2 ───────────────────────────────────────────────────────────────────
+  it('Cannot delete yourself', async () => {
+    // Login fresh to grab the operator's own JWT payload (operatorId).
+    const me = await db('operators').where({ email: TEST_OPERATOR_EMAIL }).first();
+    expect(me).toBeTruthy();
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/v1/admin/operators/${me!.id}`,
+      headers: { authorization: `Bearer ${operatorToken}` },
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json() as { detail: string };
+    expect(body.detail.toLowerCase()).toContain('your own');
+
+    // And the operator account is still active.
+    const after = await db('operators').where({ id: me!.id }).first();
+    expect(after?.is_active).toBe(true);
   });
 
   // ── m ────────────────────────────────────────────────────────────────────

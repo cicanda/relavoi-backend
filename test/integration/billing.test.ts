@@ -99,12 +99,39 @@ describe('BILLING — usage + pricing', () => {
   });
 
   // ── a ────────────────────────────────────────────────────────────────────
-  it.skip(
-    'Billing period auto-created on first usage — current BillingManager.recordUsage does NOT populate billing_period_id (NOT NULL), so the row insert fails silently. Period creation is manual / out-of-band today.',
-    () => {
-      // intentionally skipped — see comment above
-    },
-  );
+  it('Billing period auto-created on first usage', async () => {
+    // Wipe the period seeded in beforeAll (and the FK from the tenant) so we
+    // can prove recordUsage actually opens a fresh one.
+    await db('usage_records').where({ tenant_id: TEST_TENANT_ID }).del();
+    await db('tenants').where({ id: TEST_TENANT_ID }).update({ current_billing_period_id: null });
+    await db('billing_periods').where({ tenant_id: TEST_TENANT_ID }).del();
+
+    expect(await db('billing_periods').where({ tenant_id: TEST_TENANT_ID }).count('* as c').first())
+      .toMatchObject({ c: '0' });
+
+    const { getBillingManager } = await import('../../src/services/billing-manager');
+    await getBillingManager().recordUsage(TEST_TENANT_ID, 'session_created', 1);
+
+    const periods = await db('billing_periods')
+      .where({ tenant_id: TEST_TENANT_ID, status: 'ACTIVE' })
+      .orderBy('period_start', 'desc');
+    expect(periods.length).toBe(1);
+
+    // Period should be calendar-month aligned in UTC.
+    const now = new Date();
+    const expectedStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    expect(new Date(periods[0].period_start).toISOString()).toBe(expectedStart.toISOString());
+
+    // The tenant's current_billing_period_id should point at the new period.
+    const tenant = await db('tenants').where({ id: TEST_TENANT_ID }).first();
+    expect(tenant?.current_billing_period_id).toBe(periods[0].id);
+
+    // Re-attach the outer-scope billingPeriodId so the rest of the tests in
+    // this file (which insert usage_records with this FK) keep working.
+    billingPeriodId = periods[0].id;
+    periodStart = new Date(periods[0].period_start);
+    periodEnd = new Date(periods[0].period_end);
+  });
 
   // ── b ────────────────────────────────────────────────────────────────────
   it('Usage recorded and queryable via API', async () => {
@@ -202,12 +229,31 @@ describe('BILLING — usage + pricing', () => {
   });
 
   // ── e ────────────────────────────────────────────────────────────────────
-  it.skip(
-    'GET /v1/billing/periods returns periods — endpoint not implemented (billing.ts exposes only /usage, /events, /pricing)',
-    () => {
-      // intentionally skipped — no /v1/billing/periods route exists yet
-    },
-  );
+  it('GET /v1/billing/periods returns the tenant\'s periods', async () => {
+    // Make sure at least one period exists (recordUsage opens one lazily).
+    const { getBillingManager } = await import('../../src/services/billing-manager');
+    await getBillingManager().recordUsage(TEST_TENANT_ID, 'session_created', 1);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/billing/periods',
+      headers: { authorization: `Bearer ${sdkToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as {
+      data: Array<{ id: string; periodStart: string; periodEnd: string; status: string; createdAt: string }>;
+      pagination: { count: number; after: string | null };
+    };
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data.length).toBeGreaterThanOrEqual(1);
+    const first = body.data[0];
+    expect(first.id).toBeTruthy();
+    expect(first.periodStart).toBeTruthy();
+    expect(first.periodEnd).toBeTruthy();
+    expect(first.status).toMatch(/^(ACTIVE|CLOSED|INVOICED|PAID)$/);
+    expect(body.pagination).toBeDefined();
+  });
 
   // ── f ────────────────────────────────────────────────────────────────────
   it('GET /v1/billing/pricing returns tier pricing', async () => {

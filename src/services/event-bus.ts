@@ -146,8 +146,30 @@ export class EventBus {
         }
       } catch (err) {
         if (!info.running) break;
-        logger.error({ err, streamKey, group: info.group }, 'EventBus: read loop error');
-        // brief backoff
+        const msg = err instanceof Error ? err.message : String(err);
+        // Redis was flushed out from under us (common in local dev between test
+        // runs). Re-create the stream + consumer group and resume — otherwise
+        // the loop would spam NOGROUP errors every 5s forever.
+        if (msg.includes('NOGROUP')) {
+          try {
+            await this.redis.xgroup('CREATE', streamKey, info.group, '$', 'MKSTREAM');
+            logger.info(
+              { streamKey, group: info.group },
+              'EventBus: re-created consumer group after NOGROUP',
+            );
+          } catch (recreateErr) {
+            const m = recreateErr instanceof Error ? recreateErr.message : String(recreateErr);
+            if (!m.includes('BUSYGROUP')) {
+              logger.warn(
+                { err: recreateErr, streamKey, group: info.group },
+                'EventBus: NOGROUP recovery failed',
+              );
+            }
+          }
+        } else {
+          logger.error({ err, streamKey, group: info.group }, 'EventBus: read loop error');
+        }
+        // brief backoff before the next read
         await new Promise((res) => setTimeout(res, 500));
       }
     }

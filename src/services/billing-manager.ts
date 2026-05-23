@@ -61,7 +61,7 @@ export class BillingManager {
       // billing_period_id is NOT NULL in the schema. Resolve (or open) the
       // tenant's active period inside the same transaction so concurrent
       // callers can't double-create one.
-      const billingPeriodId = await this.resolveActiveBillingPeriod(tenantId);
+      const billingPeriodId = await this.ensureActivePeriod(tenantId);
       await db('usage_records').insert({
         id: randomUUID(),
         tenant_id: tenantId,
@@ -77,9 +77,11 @@ export class BillingManager {
 
   /**
    * Look up the tenant's current ACTIVE billing period, opening a fresh one
-   * (calendar-month-aligned) if none exists.
+   * (UTC-calendar-month-aligned) if none exists. Public so callers that want
+   * to materialize a period before recording usage (or to display the current
+   * period without inserting any usage) can use it directly.
    */
-  private async resolveActiveBillingPeriod(tenantId: string): Promise<string> {
+  async ensureActivePeriod(tenantId: string): Promise<string> {
     const db = getDb();
     const existing = await db('billing_periods')
       .where({ tenant_id: tenantId, status: 'ACTIVE' })
@@ -88,8 +90,8 @@ export class BillingManager {
     if (existing) return existing.id as string;
 
     const now = new Date();
-    const periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const periodEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const periodEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
     const [row] = await db('billing_periods')
       .insert({
         id: randomUUID(),
@@ -99,8 +101,12 @@ export class BillingManager {
         status: 'ACTIVE',
       })
       .returning(['id']);
-    // Best-effort: point the tenant at this period (ignore conflict if another concurrent caller already did).
-    await db('tenants').where({ id: tenantId }).update({ current_billing_period_id: row.id }).catch(() => {});
+    // Best-effort: point the tenant at this period; ignore the rare race where
+    // another concurrent caller already pointed it elsewhere.
+    await db('tenants')
+      .where({ id: tenantId })
+      .update({ current_billing_period_id: row.id })
+      .catch(() => {});
     return row.id as string;
   }
 

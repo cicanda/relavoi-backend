@@ -1,5 +1,5 @@
 import { logger } from '../utils/logger';
-import { getEventBus } from '../services/event-bus';
+import { getEventBus, type EventHandler } from '../services/event-bus';
 import { getTenantWebhookDelivery } from '../services/tenant-webhook-delivery';
 import { getBillingManager, type BillingMetric } from '../services/billing-manager';
 import { getPushService } from '../services/push-notification';
@@ -88,85 +88,96 @@ async function safePush(payload: EventPayload): Promise<void> {
 
 const CONSUMER = `consumer-${process.pid}`;
 
+/**
+ * Adapt a payload-oriented handler to the EventBus contract. The bus invokes
+ * handlers with the full envelope `{ id, type, payload }`; every consumer here
+ * only cares about the payload. Reading the envelope directly (the original
+ * bug) meant `tenantId` was always undefined and metering/webhooks/push
+ * silently no-op'd.
+ */
+function onPayload(fn: (payload: EventPayload) => Promise<void> | void): EventHandler {
+  return (event) => fn(event.payload as EventPayload);
+}
+
 export async function startEventConsumers(): Promise<void> {
   const bus = getEventBus();
 
   // session.created → metering + tenant-webhook
-  await bus.subscribe('session.created', 'metering', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('session.created', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeMeterUsage(getTenantId(payload), 'session_created', 1);
     } catch (err) {
       logger.warn({ err }, 'session.created/metering handler error');
     }
-  });
-  await bus.subscribe('session.created', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('session.created', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'session.created', payload);
     } catch (err) {
       logger.warn({ err }, 'session.created/tenant-webhook handler error');
     }
-  });
+  }));
 
   // session.activated → tenant-webhook
-  await bus.subscribe('session.activated', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('session.activated', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'session.activated', payload);
     } catch (err) {
       logger.warn({ err }, 'session.activated/tenant-webhook handler error');
     }
-  });
+  }));
 
   // session.expired → metering + tenant-webhook
-  await bus.subscribe('session.expired', 'metering', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('session.expired', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       // No additional metering on expiry by default — placeholder for future "session_lifetime" metric.
       await safeMeterUsage(getTenantId(payload), 'session_expired', 1);
     } catch (err) {
       logger.warn({ err }, 'session.expired/metering handler error');
     }
-  });
-  await bus.subscribe('session.expired', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('session.expired', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'session.expired', payload);
     } catch (err) {
       logger.warn({ err }, 'session.expired/tenant-webhook handler error');
     }
-  });
+  }));
 
   // call.incoming → push + tenant-webhook
-  await bus.subscribe('call.incoming', 'push', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('call.incoming', 'push', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safePush(payload);
     } catch (err) {
       logger.warn({ err }, 'call.incoming/push handler error');
     }
-  });
-  await bus.subscribe('call.incoming', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('call.incoming', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'call.incoming', payload);
     } catch (err) {
       logger.warn({ err }, 'call.incoming/tenant-webhook handler error');
     }
-  });
+  }));
 
   // call.answered → tenant-webhook
-  await bus.subscribe('call.answered', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('call.answered', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'call.answered', payload);
     } catch (err) {
       logger.warn({ err }, 'call.answered/tenant-webhook handler error');
     }
-  });
+  }));
 
   // call.ended → tenant-webhook + metering (call_minute)
-  await bus.subscribe('call.ended', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('call.ended', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'call.ended', payload);
     } catch (err) {
       logger.warn({ err }, 'call.ended/tenant-webhook handler error');
     }
-  });
-  await bus.subscribe('call.ended', 'metering', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('call.ended', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       const tenantId = getTenantId(payload);
       const seconds = Number((payload as Record<string, unknown>).durationSeconds ?? 0);
@@ -175,64 +186,64 @@ export async function startEventConsumers(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'call.ended/metering handler error');
     }
-  });
+  }));
 
   // call.failed → tenant-webhook + metering
-  await bus.subscribe('call.failed', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('call.failed', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'call.failed', payload);
     } catch (err) {
       logger.warn({ err }, 'call.failed/tenant-webhook handler error');
     }
-  });
-  await bus.subscribe('call.failed', 'metering', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('call.failed', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeMeterUsage(getTenantId(payload), 'call_failed', 1);
     } catch (err) {
       logger.warn({ err }, 'call.failed/metering handler error');
     }
-  });
+  }));
 
   // sms.sent → metering + tenant-webhook
-  await bus.subscribe('sms.sent', 'metering', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('sms.sent', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeMeterUsage(getTenantId(payload), 'sms_sent', 1);
     } catch (err) {
       logger.warn({ err }, 'sms.sent/metering handler error');
     }
-  });
-  await bus.subscribe('sms.sent', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('sms.sent', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'sms.sent', payload);
     } catch (err) {
       logger.warn({ err }, 'sms.sent/tenant-webhook handler error');
     }
-  });
+  }));
 
   // sms.received → metering + tenant-webhook
-  await bus.subscribe('sms.received', 'metering', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('sms.received', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeMeterUsage(getTenantId(payload), 'sms_received', 1);
     } catch (err) {
       logger.warn({ err }, 'sms.received/metering handler error');
     }
-  });
-  await bus.subscribe('sms.received', 'tenant-webhook', CONSUMER, async (payload: EventPayload) => {
+  }));
+  await bus.subscribe('sms.received', 'tenant-webhook', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       await safeDeliverWebhook(getTenantId(payload), 'sms.received', payload);
     } catch (err) {
       logger.warn({ err }, 'sms.received/tenant-webhook handler error');
     }
-  });
+  }));
 
   // pool.low_availability → log + metric
-  await bus.subscribe('pool.low_availability', 'alerting', CONSUMER, async (payload: EventPayload) => {
+  await bus.subscribe('pool.low_availability', 'alerting', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       logger.warn({ payload }, 'pool.low_availability event received');
     } catch (err) {
       logger.warn({ err }, 'pool.low_availability handler error');
     }
-  });
+  }));
 
   logger.info('event-consumers: started');
 }

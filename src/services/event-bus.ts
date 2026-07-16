@@ -1,3 +1,4 @@
+import type Redis from 'ioredis';
 import { getRedis, getRedisSub } from '../config/redis';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
@@ -19,6 +20,11 @@ interface ConsumerInfo {
   consumer: string;
   handler: EventHandler;
   running: boolean;
+  // Dedicated connection for the blocking XREADGROUP loop. A BLOCK read holds
+  // its connection until it returns, so it must NOT share the main client —
+  // otherwise XADD/XACK (and every other command) would queue behind it and
+  // deadlock delivery.
+  reader: Redis;
 }
 
 const STREAM_PREFIX = 'events:';
@@ -84,8 +90,13 @@ export class EventBus {
     }
 
     // Best-effort create group; MKSTREAM creates the stream if it doesn't exist.
+    // NOTE: ioredis auto-prefixes XADD/XREADGROUP/XACK keys but NOT the XGROUP
+    // key argument, so we must prepend REDIS_PREFIX by hand here — otherwise the
+    // group is created on an unprefixed key while reads target the prefixed one,
+    // producing a permanent NOGROUP loop (the real cause of the dead pipeline).
+    const groupKey = `${config.REDIS_PREFIX}${streamKey}`;
     try {
-      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM');
+      await this.redis.xgroup('CREATE', groupKey, consumerGroup, '$', 'MKSTREAM');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (!msg.includes('BUSYGROUP')) {
@@ -99,6 +110,7 @@ export class EventBus {
       consumer: consumerId,
       handler,
       running: true,
+      reader: this.redis.duplicate(),
     };
     this.consumers.set(key, info);
 
@@ -110,7 +122,7 @@ export class EventBus {
   private async readLoop(streamKey: string, info: ConsumerInfo): Promise<void> {
     while (info.running) {
       try {
-        const raw = (await this.redis.xreadgroup(
+        const raw = (await info.reader.xreadgroup(
           'GROUP',
           info.group,
           info.consumer,
@@ -134,7 +146,7 @@ export class EventBus {
             try {
               const payload = obj.payload ? (JSON.parse(obj.payload) as EventPayload) : {};
               await info.handler({ id: entryId, type: obj.type ?? info.eventType, payload });
-              await this.redis.xack(streamKey, info.group, entryId);
+              await info.reader.xack(streamKey, info.group, entryId);
             } catch (handlerErr) {
               logger.error(
                 { err: handlerErr, streamKey, entryId, group: info.group },
@@ -152,7 +164,13 @@ export class EventBus {
         // the loop would spam NOGROUP errors every 5s forever.
         if (msg.includes('NOGROUP')) {
           try {
-            await this.redis.xgroup('CREATE', streamKey, info.group, '$', 'MKSTREAM');
+            await info.reader.xgroup(
+              'CREATE',
+              `${config.REDIS_PREFIX}${streamKey}`,
+              info.group,
+              '$',
+              'MKSTREAM',
+            );
             logger.info(
               { streamKey, group: info.group },
               'EventBus: re-created consumer group after NOGROUP',
@@ -180,10 +198,16 @@ export class EventBus {
   }
 
   async close(): Promise<void> {
+    const readers: Redis[] = [];
     for (const info of this.consumers.values()) {
       info.running = false;
+      readers.push(info.reader);
     }
     this.consumers.clear();
+    // Tear down the dedicated reader connections so the process can exit.
+    await Promise.all(
+      readers.map((r) => r.quit().catch(() => r.disconnect())),
+    );
   }
 }
 

@@ -4,6 +4,7 @@ import { getDb } from '../config/database';
 import { logger } from '../utils/logger';
 import { decryptPhone, encryptPhone, hashPhone } from '../utils/crypto';
 import { sendSms } from './africastalking/sms-sender';
+import { getEventBus } from './event-bus';
 
 const DEDUP_TTL_SEC = 60;
 
@@ -170,29 +171,52 @@ export class SmsRouter {
     }
 
     // Forward via AT (fire-and-forget so webhook returns fast, but record status)
-    void this.forward(smsRecordId, args.proxyNumber, destination, args.body);
+    void this.forward({
+      smsRecordId,
+      from: args.proxyNumber,
+      to: destination,
+      body: args.body,
+      sessionId: matched.sessionId,
+      tenantId: matched.tenantId,
+      direction: matched.callerIsA ? 'A_TO_B' : 'B_TO_A',
+    });
 
     return decision;
   }
 
-  private async forward(
-    smsRecordId: string,
-    from: string,
-    to: string,
-    body: string,
-  ): Promise<void> {
-    const result = await sendSms({ from, to, message: body });
+  private async forward(args: {
+    smsRecordId: string;
+    from: string;
+    to: string;
+    body: string;
+    sessionId: string;
+    tenantId: string;
+    direction: 'A_TO_B' | 'B_TO_A';
+  }): Promise<void> {
+    const result = await sendSms({ from: args.from, to: args.to, message: args.body });
+    const sent = result.status === 'sent';
     try {
       const db = getDb();
       await db('sms_records')
-        .where({ id: smsRecordId })
+        .where({ id: args.smsRecordId })
         .update({
-          status: result.status === 'sent' ? 'DELIVERED' : 'FAILED',
+          status: sent ? 'DELIVERED' : 'FAILED',
           cpaas_message_id: result.messageId ?? null,
-          delivered_at: result.status === 'sent' ? new Date() : null,
+          delivered_at: sent ? new Date() : null,
         });
     } catch (e) {
-      logger.warn({ err: e, smsRecordId }, 'SmsRouter: sms_records update failed');
+      logger.warn({ err: e, smsRecordId: args.smsRecordId }, 'SmsRouter: sms_records update failed');
+    }
+
+    if (sent) {
+      void getEventBus()
+        .publish('sms.sent', {
+          tenantId: args.tenantId,
+          sessionId: args.sessionId,
+          direction: args.direction,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((e) => logger.warn({ err: e, smsRecordId: args.smsRecordId }, 'SmsRouter: publish sms.sent failed'));
     }
   }
 

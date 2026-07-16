@@ -9,6 +9,27 @@ function rfc7807(slug: string, title: string, status: number, detail: string): R
   return { type: `https://api.relavoi.com/errors/${slug}`, title, status, detail };
 }
 
+function num(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Map a raw tier_pricing row to a camelCase DTO with numeric fields. */
+function pricingRowDto(r: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: r.id,
+    tier: r.tier,
+    metric: r.metric,
+    unitPrice: num(r.unit_price),
+    includedQuantity: num(r.included_quantity),
+    overagePrice: num(r.overage_price),
+    currency: r.currency,
+    effectiveFrom: r.effective_from,
+    effectiveUntil: r.effective_until,
+  };
+}
+
 const periodSchema = z.object({
   periodStart: z.string().datetime({ offset: true }),
   periodEnd: z.string().datetime({ offset: true }),
@@ -116,12 +137,13 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  // GET /billing/pricing — returns tier_pricing rows (public-ish)
+  // GET /billing/pricing — returns tier_pricing rows as camelCase DTOs with
+  // numeric price/quantity fields (Postgres NUMERIC comes back as strings).
   app.get('/billing/pricing', { preHandler: [authenticate, tierRateLimit] }, async (_req, reply) => {
     const db = getDb();
     try {
       const rows = await db('tier_pricing').select('*').orderBy('tier');
-      return reply.send({ tiers: rows });
+      return reply.send({ tiers: rows.map(pricingRowDto) });
     } catch {
       return reply.send({ tiers: [] });
     }

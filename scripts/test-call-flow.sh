@@ -18,11 +18,11 @@
 #   16. End session
 #   17. Replay incoming call after end → expired-session XML response
 #
-# Usage: BASE_URL=http://localhost:3000 ./scripts/test-call-flow.sh
+# Usage: BASE_URL=http://localhost:8080 ./scripts/test-call-flow.sh
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
+BASE_URL="${BASE_URL:-http://localhost:8080}"
 API_KEY="${API_KEY:-sk_test_relavoi_dev_0123456789abcdef}"
 API_SECRET="${API_SECRET:-secret_test_relavoi_dev_fedcba9876543210}"
 

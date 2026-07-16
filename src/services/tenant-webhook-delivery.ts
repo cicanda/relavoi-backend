@@ -121,11 +121,12 @@ export class TenantWebhookDelivery {
         id: randomUUID(),
         tenant_id: item.tenantId,
         event_type: item.eventType,
-        url: item.url,
-        status_code: statusCode,
-        attempt: item.attempt,
-        succeeded,
-        created_at: new Date(),
+        delivery_url: item.url,
+        http_status: statusCode,
+        response_body: errorMsg ?? null,
+        attempt_number: item.attempt,
+        success: succeeded,
+        delivered_at: new Date(),
       });
     } catch (logErr) {
       logger.warn({ err: logErr }, 'TenantWebhookDelivery: log insert failed');

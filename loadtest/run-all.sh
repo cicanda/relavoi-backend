@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run all k6 load tests in sequence, writing JSON+text results to ./results.
 #
-# Usage: BASE_URL=http://localhost:3000 ./loadtest/run-all.sh
+# Usage: BASE_URL=http://localhost:8080 ./loadtest/run-all.sh
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
+BASE_URL="${BASE_URL:-http://localhost:8080}"
 export BASE_URL
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }

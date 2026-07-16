@@ -81,6 +81,7 @@ const changePasswordSchema = z.object({
 
 const configPatchSchema = z
   .object({
+    name: z.string().min(1).max(255).optional(),
     webhookUrl: z.string().url().nullable().optional(),
     defaultGracePeriod: z.number().int().nonnegative().optional(),
     expiredCallBehavior: z.enum(['DEAD_LINE', 'REDIRECT_SUPPORT', 'PLAY_MESSAGE']).optional(),
@@ -257,8 +258,10 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const db = getDb();
+      // is_active filter: deactivated users must not authenticate. Same generic
+      // 401 as unknown email so account state is not disclosed.
       const user = await db('tenant_users')
-        .where({ email: parsed.data.email.toLowerCase() })
+        .where({ email: parsed.data.email.toLowerCase(), is_active: true })
         .first();
 
       if (!user) {
@@ -274,13 +277,6 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
           .status(401)
           .type('application/problem+json')
           .send(rfc7807('unauthorized', 'Unauthorized', 401, 'Invalid email or password.'));
-      }
-
-      if (user.status && user.status !== 'ACTIVE') {
-        return reply
-          .status(403)
-          .type('application/problem+json')
-          .send(rfc7807('forbidden', 'Forbidden', 403, `User status is ${user.status}.`));
       }
 
       const tenant = await db('tenants').where({ id: user.tenant_id }).first();
@@ -299,7 +295,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
           userId: user.id,
           role: user.role,
         },
-        { expiresIn: config.JWT_EXPIRY },
+        { expiresIn: config.DASHBOARD_JWT_EXPIRY },
       );
 
       return reply.send({
@@ -504,6 +500,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
 
       const update: Record<string, unknown> = { updated_at: new Date() };
       const body = parsed.data;
+      if (body.name !== undefined) update.name = body.name;
       if (body.webhookUrl !== undefined) update.webhook_url = body.webhookUrl;
       if (body.defaultGracePeriod !== undefined) update.default_grace_period = body.defaultGracePeriod;
       if (body.expiredCallBehavior !== undefined) update.expired_call_behavior = body.expiredCallBehavior;

@@ -1,8 +1,8 @@
 #!/usr/bin/env tsx
 import knex from 'knex';
-import knexConfig from '../src/config/knexfile';
-import { logger } from '../src/utils/logger';
-import { config } from '../src/config/env';
+import knexConfig from '../config/knexfile';
+import { logger } from '../utils/logger';
+import { config } from '../config/env';
 
 async function main(): Promise<void> {
   const cfg = knexConfig[config.NODE_ENV] ?? knexConfig.development;

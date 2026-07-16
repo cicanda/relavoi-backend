@@ -13,11 +13,11 @@
 # a single number for the duration of the test, then restores all numbers
 # at the end.
 #
-# Usage: BASE_URL=http://localhost:3000 ./scripts/test-multi-session-proxy.sh
+# Usage: BASE_URL=http://localhost:8080 ./scripts/test-multi-session-proxy.sh
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-http://localhost:3000}"
+BASE_URL="${BASE_URL:-http://localhost:8080}"
 API_KEY="${API_KEY:-sk_test_relavoi_dev_0123456789abcdef}"
 API_SECRET="${API_SECRET:-secret_test_relavoi_dev_fedcba9876543210}"
 REDIS_PREFIX="${REDIS_PREFIX:-relavoi:}"

@@ -23,6 +23,9 @@ const envSchema = z.object({
   // Auth / Crypto
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRY: z.string().default('15m'),
+  // Dashboard (tenant_user) sessions are interactive; a 15-min SDK-style expiry
+  // forced a relogin mid-session. Give them a longer, human-session TTL.
+  DASHBOARD_JWT_EXPIRY: z.string().default('24h'),
   ENCRYPTION_MASTER_KEY: z.string().min(64, 'ENCRYPTION_MASTER_KEY must be at least 64 characters'),
 
   // Africa's Talking
@@ -60,8 +63,13 @@ const envSchema = z.object({
   CB_RECOVERY_CHECK_COUNT: z.coerce.number().int().positive().default(5),
   CB_HALF_OPEN_TRAFFIC_PERCENT: z.coerce.number().min(0).max(100).default(10),
 
-  // Load test
-  LOAD_TEST_MODE: z.coerce.boolean().default(false),
+  // Load test. Must be the exact string 'true' to enable — z.coerce.boolean()
+  // treated any non-empty string (including 'false') as true, which silently
+  // disabled all rate limiting.
+  LOAD_TEST_MODE: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 export type Config = z.infer<typeof envSchema>;

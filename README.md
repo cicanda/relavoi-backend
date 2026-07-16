@@ -30,9 +30,9 @@ npm run docker:up          # postgres + redis on :5432 and :6379
 npm run migrate            # apply the consolidated schema
 npm run seed               # dev tenant + user + numbers + operator
 npm run seed:pricing
-npm run dev                # listens on http://localhost:3000
+npm run dev                # listens on http://localhost:8080
 
-curl http://localhost:3000/v1/health
+curl http://localhost:8080/v1/health
 ```
 
 ## Dev credentials (created by `npm run seed`)

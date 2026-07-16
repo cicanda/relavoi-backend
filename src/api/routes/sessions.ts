@@ -182,7 +182,10 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
       data,
       pagination: {
         count: data.length,
-        after: rows.length === parsed.data.limit ? rows[rows.length - 1].id : null,
+        after:
+        rows.length === parsed.data.limit
+          ? rows[rows.length - 1].createdAt.toISOString()
+          : null,
       },
     });
   });
@@ -363,9 +366,9 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
       }
       const q = db('sms_records')
         .where({ session_id: req.params.id })
-        .orderBy('created_at', 'desc')
+        .orderBy('sent_at', 'desc')
         .limit(parsed.data.limit + 1);
-      if (parsed.data.after) q.andWhere('id', '<', parsed.data.after);
+      if (parsed.data.after) q.andWhere('sent_at', '<', new Date(parsed.data.after));
 
       const rows = await q;
       const hasMore = rows.length > parsed.data.limit;
@@ -375,7 +378,7 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
         data,
         pagination: {
           count: data.length,
-          after: hasMore ? page[page.length - 1].id : null,
+          after: hasMore ? new Date(page[page.length - 1].sent_at).toISOString() : null,
         },
       });
     },

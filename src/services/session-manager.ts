@@ -6,6 +6,7 @@ import { logger } from '../utils/logger';
 import { encryptPhone, hashPhone } from '../utils/crypto';
 import { activeSessionsGauge, sessionCreatedTotal } from '../utils/metrics';
 import { getNumberPool } from './number-pool';
+import { getEventBus } from './event-bus';
 
 /** E.164 (+ followed by 8-15 digits). */
 const E164_RE = /^\+[1-9]\d{7,14}$/;
@@ -248,6 +249,20 @@ export class SessionManager {
 
       const row = await db<DbSessionRow>('sessions').where({ id: sessionId }).first();
       if (!row) throw err('SESSION_NOT_FOUND', 500, 'Inserted session vanished');
+
+      // Publish for downstream consumers (metering, tenant webhooks, WS fan-out).
+      // Fire-and-forget: a bus hiccup must not fail session creation.
+      void getEventBus()
+        .publish('session.created', {
+          tenantId,
+          sessionId,
+          proxyNumber: proxy,
+          directionMode,
+          recordingEnabled,
+          timestamp: now.toISOString(),
+        })
+        .catch((e) => logger.warn({ err: e, sessionId }, 'SessionManager: publish session.created failed'));
+
       return rowToSession(row);
     } catch (e) {
       // Rollback allocation
@@ -352,6 +367,15 @@ export class SessionManager {
     }
 
     activeSessionsGauge.dec({ tenant_id: row.tenant_id });
+
+    void getEventBus()
+      .publish('session.expired', {
+        tenantId: row.tenant_id,
+        sessionId: id,
+        proxyNumber: row.proxy_number,
+        timestamp: now.toISOString(),
+      })
+      .catch((e) => logger.warn({ err: e, sessionId: id }, 'SessionManager: publish session.expired failed'));
 
     logger.info({ sessionId: id, tenantId: row.tenant_id }, 'Session expired');
     return true;

@@ -49,6 +49,7 @@ services:
       ENCRYPTION_MASTER_KEY: "${ENCRYPTION_MASTER_KEY}"
       AT_API_KEY: "${AT_API_KEY}"
       AT_USERNAME: "${AT_USERNAME:-sandbox}"
+      AT_ENVIRONMENT: "${AT_ENVIRONMENT:-sandbox}"
       WEBHOOK_BASE_URL: "${WEBHOOK_BASE_URL:-https://api.relavoi.com}"
     restart: "no"
 
@@ -63,10 +64,10 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "3000:3000"
+      - "8080:8080"
     environment:
       NODE_ENV: production
-      PORT: 3000
+      PORT: 8080
       HOST: 0.0.0.0
       LOG_LEVEL: info
       DATABASE_URL: "postgresql://relavoi:${POSTGRES_PASSWORD:-relavoi_dev}@postgres:5432/relavoi"
@@ -76,6 +77,7 @@ services:
       ENCRYPTION_MASTER_KEY: "${ENCRYPTION_MASTER_KEY}"
       AT_API_KEY: "${AT_API_KEY}"
       AT_USERNAME: "${AT_USERNAME:-sandbox}"
+      AT_ENVIRONMENT: "${AT_ENVIRONMENT:-sandbox}"
       WEBHOOK_BASE_URL: "${WEBHOOK_BASE_URL:-https://api.relavoi.com}"
     restart: unless-stopped
 

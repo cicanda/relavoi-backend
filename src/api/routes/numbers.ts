@@ -33,17 +33,9 @@ export async function numberRoutes(app: FastifyInstance): Promise<void> {
           .type('application/problem+json')
           .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
       }
-      return reply
-        .status(501)
-        .type('application/problem+json')
-        .send(
-          rfc7807(
-            'not-implemented',
-            'Not Implemented',
-            501,
-            'Number provisioning is a roadmap feature. Contact support to request additional numbers for your region.',
-          ),
-        );
+      return reply.status(501).send({
+        error: 'Number provisioning via API is not yet available. Contact support.',
+      });
     },
   );
 }

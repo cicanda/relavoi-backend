@@ -13,15 +13,15 @@
     "lint": "eslint src/ --ext .ts",
     "lint:fix": "eslint src/ --ext .ts --fix",
     "format": "prettier --write 'src/**/*.ts'",
-    "migrate": "tsx scripts/run-migrations.ts",
+    "migrate": "tsx src/scripts/run-migrations.ts",
     "migrate:make": "knex migrate:make --knexfile src/config/knexfile.ts",
     "seed": "tsx scripts/run-seed.ts",
     "seed:pricing": "tsx scripts/run-pricing-seed.ts",
     "docker:up": "docker compose -f docker/docker-compose.yml up -d",
     "docker:down": "docker compose -f docker/docker-compose.yml down",
     "docker:build": "docker build -f docker/Dockerfile -t relavoi-api:latest .",
-    "docker:full-up": "docker compose -f docker/docker-compose.full.yml up -d",
-    "docker:full-down": "docker compose -f docker/docker-compose.full.yml down"
+    "docker:full-up": "docker compose --env-file .env -f docker/docker-compose.full.yml up -d",
+    "docker:full-down": "docker compose --env-file .env -f docker/docker-compose.full.yml down"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",

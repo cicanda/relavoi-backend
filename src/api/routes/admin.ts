@@ -9,6 +9,7 @@ import { adminAuthenticate, requireRole } from '../middleware/admin-auth';
 import { getNumberPool } from '../../services/number-pool';
 import { getAuditLogger } from '../../services/audit-logger';
 import { getBillingManager } from '../../services/billing-manager';
+import { getCircuitBreaker } from '../../services/circuit-breaker';
 
 const BCRYPT_COST = 10;
 
@@ -49,11 +50,41 @@ const dlqRetrySchema = z.object({
   ids: z.array(z.string()).optional(),
 });
 
+const OPERATOR_ROLES = ['ROOT', 'SRE', 'SUPPORT', 'VIEWER'] as const;
+
 const operatorCreateSchema = z.object({
   email: z.string().email(),
   name: z.string().min(1),
-  role: z.enum(['ROOT', 'SRE', 'SUPPORT']),
+  role: z.enum(OPERATOR_ROLES),
   password: z.string().min(12).max(128),
+});
+
+const operatorUpdateSchema = z
+  .object({
+    name: z.string().min(1).max(255).optional(),
+    role: z.enum(OPERATOR_ROLES).optional(),
+    isActive: z.boolean().optional(),
+    password: z.string().min(12).max(128).optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: 'At least one field is required' });
+
+const dlqListQuery = z.object({
+  status: z.enum(['PENDING', 'RETRYING', 'RESOLVED', 'ABANDONED']).optional(),
+  provider: z.string().optional(),
+  limit: z.coerce.number().int().positive().max(200).default(50),
+  after: z.string().optional(),
+});
+
+const pricingPatchSchema = z
+  .object({
+    unitPrice: z.number().nonnegative().optional(),
+    includedQuantity: z.number().nonnegative().optional(),
+    overagePrice: z.number().nonnegative().nullable().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: 'At least one field is required' });
+
+const cpaasProviderParams = z.object({
+  provider: z.enum(['africastalking', 'twilio']),
 });
 
 const auditQuery = z.object({
@@ -98,9 +129,58 @@ function operatorDto(o: Record<string, unknown>): Record<string, unknown> {
     email: o.email,
     name: o.name,
     role: o.role,
-    status: o.status ?? 'ACTIVE',
+    isActive: o.is_active ?? true,
     createdAt: o.created_at,
     lastLoginAt: o.last_login_at ?? null,
+  };
+}
+
+function num(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pricingRowDto(r: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: r.id,
+    tier: r.tier,
+    metric: r.metric,
+    unitPrice: num(r.unit_price),
+    includedQuantity: num(r.included_quantity),
+    overagePrice: num(r.overage_price),
+    currency: r.currency,
+    effectiveFrom: r.effective_from,
+    effectiveUntil: r.effective_until,
+  };
+}
+
+function dlqEntryDto(r: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: r.id,
+    eventId: r.event_id,
+    provider: r.provider,
+    payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload ?? {}),
+    errorMessage: r.error_message ?? null,
+    retryCount: r.retry_count ?? 0,
+    maxRetries: r.max_retries ?? 0,
+    status: r.status,
+    firstReceivedAt: r.first_received_at,
+    lastRetryAt: r.last_retry_at ?? null,
+    resolvedAt: r.resolved_at ?? null,
+  };
+}
+
+function proxyNumberDto(r: Record<string, unknown>): Record<string, unknown> {
+  return {
+    number: r.number,
+    region: r.region ?? null,
+    provider: r.provider,
+    status: r.status,
+    lastUsedAt: r.last_used_at ?? null,
+    cooldownUntil: r.cooldown_until ?? null,
+    healthCheckAt: r.health_check_at ?? null,
+    provisionedAt: r.provisioned_at ?? null,
   };
 }
 
@@ -347,9 +427,55 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ─── GET /admin/fleet ─────────────────────────────────────────────────────────
+  // Returns per-region pool aggregates AND the individual numbers so the console
+  // can render both the utilization summary and the per-number management table.
   app.get('/admin/fleet', { preHandler: [adminAuthenticate] }, async (_req, reply) => {
+    const db = getDb();
     const pools = await getNumberPool().getPoolStatus();
-    return reply.send({ pools });
+
+    const numberRows = await db('proxy_numbers')
+      .select(
+        'number',
+        'region',
+        'provider',
+        'status',
+        'last_used_at',
+        'cooldown_until',
+        'health_check_at',
+        'provisioned_at',
+      )
+      .orderBy('number');
+
+    const blank = () => ({ total: 0, available: 0, inUse: 0, cooldown: 0, quarantined: 0 });
+    const totals = blank();
+    const regionMap = new Map<string, ReturnType<typeof blank> & { region: string }>();
+
+    const bump = (acc: ReturnType<typeof blank>, status: string): void => {
+      acc.total += 1;
+      if (status === 'AVAILABLE') acc.available += 1;
+      else if (status === 'IN_USE') acc.inUse += 1;
+      else if (status === 'COOLDOWN') acc.cooldown += 1;
+      else if (status === 'QUARANTINED') acc.quarantined += 1;
+    };
+
+    for (const r of numberRows) {
+      const status = r.status as string;
+      bump(totals, status);
+      const region = (r.region as string | null) ?? 'unknown';
+      let ra = regionMap.get(region);
+      if (!ra) {
+        ra = { region, ...blank() };
+        regionMap.set(region, ra);
+      }
+      bump(ra, status);
+    }
+
+    return reply.send({
+      pools,
+      totals,
+      byRegion: Array.from(regionMap.values()).sort((a, b) => a.region.localeCompare(b.region)),
+      numbers: numberRows.map(proxyNumberDto),
+    });
   });
 
   // ─── GET /admin/system/health ─────────────────────────────────────────────────
@@ -565,14 +691,18 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // ─── GET /admin/operators ─────────────────────────────────────────────────────
-  app.get('/admin/operators', { preHandler: [adminAuthenticate] }, async (_req, reply) => {
-    const db = getDb();
-    const rows = await db('operators')
-      .select('id', 'email', 'name', 'role', 'is_active', 'created_at', 'last_login_at')
-      .orderBy('created_at', 'desc');
-    return reply.send({ data: rows.map(operatorDto) });
-  });
+  // ─── GET /admin/operators (ROOT) ──────────────────────────────────────────────
+  app.get(
+    '/admin/operators',
+    { preHandler: [adminAuthenticate, requireRole('ROOT')] },
+    async (_req, reply) => {
+      const db = getDb();
+      const rows = await db('operators')
+        .select('id', 'email', 'name', 'role', 'is_active', 'created_at', 'last_login_at')
+        .orderBy('created_at', 'desc');
+      return reply.send({ data: rows.map(operatorDto) });
+    },
+  );
 
   // ─── POST /admin/operators (ROOT) ─────────────────────────────────────────────
   app.post(
@@ -721,9 +851,229 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     try {
       const rows = await db('tier_pricing').select('*').orderBy('tier');
-      return reply.send({ tiers: rows });
+      return reply.send({ tiers: rows.map(pricingRowDto) });
     } catch {
       return reply.send({ tiers: [] });
     }
   });
+
+  // ─── PATCH /admin/pricing/:id (ROOT) ──────────────────────────────────────────
+  app.patch<{ Params: { id: string } }>(
+    '/admin/pricing/:id',
+    { preHandler: [adminAuthenticate, requireRole('ROOT')] },
+    async (req, reply) => {
+      const parsed = pricingPatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+      const db = getDb();
+      const existing = await db('tier_pricing').where({ id: req.params.id }).first();
+      if (!existing) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Pricing row not found.'));
+      }
+      const update: Record<string, unknown> = {};
+      if (parsed.data.unitPrice !== undefined) update.unit_price = parsed.data.unitPrice;
+      if (parsed.data.includedQuantity !== undefined)
+        update.included_quantity = parsed.data.includedQuantity;
+      if (parsed.data.overagePrice !== undefined) update.overage_price = parsed.data.overagePrice;
+      await db('tier_pricing').where({ id: req.params.id }).update(update);
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'pricing.update',
+          resourceType: 'tier_pricing',
+          resourceId: req.params.id,
+          metadata: parsed.data,
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      const row = await db('tier_pricing').where({ id: req.params.id }).first();
+      return reply.send(pricingRowDto(row));
+    },
+  );
+
+  // ─── GET /admin/dlq ───────────────────────────────────────────────────────────
+  app.get('/admin/dlq', { preHandler: [adminAuthenticate] }, async (req, reply) => {
+    const parsed = dlqListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .type('application/problem+json')
+        .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+    }
+    const db = getDb();
+    try {
+      const q = db('webhook_dlq')
+        .select('*')
+        .orderBy('first_received_at', 'desc')
+        .limit(parsed.data.limit + 1);
+      if (parsed.data.status) q.andWhere('status', parsed.data.status);
+      if (parsed.data.provider) q.andWhere('provider', parsed.data.provider);
+      if (parsed.data.after) q.andWhere('id', '<', parsed.data.after);
+      const rows = await q;
+      const hasMore = rows.length > parsed.data.limit;
+      const page = hasMore ? rows.slice(0, parsed.data.limit) : rows;
+
+      const counts = await db('webhook_dlq')
+        .select('status')
+        .count<{ status: string; count: string }[]>('* as count')
+        .groupBy('status');
+      const summary = { pending: 0, retrying: 0, resolved: 0, abandoned: 0 };
+      for (const c of counts) {
+        const n = Number(c.count);
+        if (c.status === 'PENDING') summary.pending = n;
+        else if (c.status === 'RETRYING') summary.retrying = n;
+        else if (c.status === 'RESOLVED') summary.resolved = n;
+        else if (c.status === 'ABANDONED') summary.abandoned = n;
+      }
+
+      return reply.send({
+        data: page.map(dlqEntryDto),
+        pagination: {
+          count: page.length,
+          after: hasMore ? page[page.length - 1].id : null,
+        },
+        summary,
+      });
+    } catch (err) {
+      logger.warn({ err }, 'admin/dlq query failed');
+      return reply.send({
+        data: [],
+        pagination: { count: 0, after: null },
+        summary: { pending: 0, retrying: 0, resolved: 0, abandoned: 0 },
+      });
+    }
+  });
+
+  // ─── POST /admin/dlq/:id/abandon (ROOT|SRE) ───────────────────────────────────
+  app.post<{ Params: { id: string } }>(
+    '/admin/dlq/:id/abandon',
+    { preHandler: [adminAuthenticate, requireRole('ROOT', 'SRE')] },
+    async (req, reply) => {
+      const db = getDb();
+      const row = await db('webhook_dlq').where({ id: req.params.id }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'DLQ entry not found.'));
+      }
+      await db('webhook_dlq')
+        .where({ id: req.params.id })
+        .update({ status: 'ABANDONED', resolved_at: new Date() });
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'dlq.abandon',
+          resourceType: 'webhook_dlq',
+          resourceId: req.params.id,
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      return reply.send({ success: true, id: req.params.id });
+    },
+  );
+
+  // ─── PATCH /admin/operators/:id (ROOT) ────────────────────────────────────────
+  app.patch<{ Params: { id: string } }>(
+    '/admin/operators/:id',
+    { preHandler: [adminAuthenticate, requireRole('ROOT')] },
+    async (req, reply) => {
+      const params = operatorIdParamsSchema.safeParse(req.params);
+      if (!params.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, params.error.message));
+      }
+      const parsed = operatorUpdateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+      const db = getDb();
+      const op = await db('operators').where({ id: params.data.id }).first();
+      if (!op) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Operator not found'));
+      }
+      // Self-protection: don't let a ROOT lock or demote themselves out of access.
+      if (params.data.id === req.operator!.id) {
+        if (parsed.data.isActive === false || (parsed.data.role && parsed.data.role !== 'ROOT')) {
+          return reply
+            .status(400)
+            .type('application/problem+json')
+            .send(rfc7807('self-lockout', 'Bad Request', 400, 'Cannot demote or deactivate your own account.'));
+        }
+      }
+
+      const update: Record<string, unknown> = { updated_at: new Date() };
+      if (parsed.data.name !== undefined) update.name = parsed.data.name;
+      if (parsed.data.role !== undefined) update.role = parsed.data.role;
+      if (parsed.data.isActive !== undefined) update.is_active = parsed.data.isActive;
+      if (parsed.data.password !== undefined) {
+        update.password_hash = await bcrypt.hash(parsed.data.password, BCRYPT_COST);
+      }
+      await db('operators').where({ id: params.data.id }).update(update);
+
+      await getAuditLogger()
+        .log({
+          actorType: 'operator',
+          actorId: req.operator!.id,
+          action: 'operator.update',
+          resourceType: 'operator',
+          resourceId: params.data.id,
+          metadata: { fields: Object.keys(parsed.data) },
+        })
+        .catch((err) => logger.warn({ err }, 'audit log failed'));
+
+      const updated = await db('operators').where({ id: params.data.id }).first();
+      return reply.send(operatorDto(updated));
+    },
+  );
+
+  // ─── POST /admin/cpaas/:provider/force-open|force-close (ROOT|SRE) ────────────
+  for (const [suffix, state] of [
+    ['force-open', 'OPEN'],
+    ['force-close', 'CLOSED'],
+  ] as const) {
+    app.post<{ Params: { provider: string } }>(
+      `/admin/cpaas/:provider/${suffix}`,
+      { preHandler: [adminAuthenticate, requireRole('ROOT', 'SRE')] },
+      async (req, reply) => {
+        const params = cpaasProviderParams.safeParse(req.params);
+        if (!params.success) {
+          return reply
+            .status(400)
+            .type('application/problem+json')
+            .send(rfc7807('validation', 'Bad Request', 400, params.error.message));
+        }
+        await getCircuitBreaker(params.data.provider).forceState(state);
+        await getAuditLogger()
+          .log({
+            actorType: 'operator',
+            actorId: req.operator!.id,
+            action: `cpaas.${suffix}`,
+            resourceType: 'circuit_breaker',
+            resourceId: params.data.provider,
+          })
+          .catch((err) => logger.warn({ err }, 'audit log failed'));
+        return reply.send({ success: true, provider: params.data.provider, state });
+      },
+    );
+  }
 }

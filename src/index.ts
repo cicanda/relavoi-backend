@@ -108,24 +108,39 @@ async function start(): Promise<void> {
 
   if (mode === 'api' || mode === 'worker') {
     const { SessionExpiryWorker } = await import('./workers/session-expiry');
+    const { PoolReaperWorker } = await import('./workers/pool-reaper');
     const { MetricsUpdater } = await import('./workers/metrics-updater');
     const { CpaasHealthCheckWorker } = await import('./workers/cpaas-health-check');
     const { startEventConsumers, stopEventConsumers } = await import('./workers/event-consumers');
 
     const { getSessionManager } = await import('./services/session-manager');
+    const { getNumberPool } = await import('./services/number-pool');
     const sessionManager = getSessionManager();
+    const numberPool = getNumberPool();
+
+    // CRITICAL: hydrate the Redis pool from Postgres on boot. Without this, a
+    // Redis restart leaves the pool empty and no sessions can be created.
+    try {
+      const { loaded, regions } = await numberPool.loadPoolFromDb();
+      logger.info({ loaded, regions }, 'Number pool hydrated from DB');
+    } catch (err) {
+      logger.error({ err }, 'Number pool hydration failed');
+    }
 
     const expiry = new SessionExpiryWorker(sessionManager);
+    const poolReaper = new PoolReaperWorker(numberPool);
     const metricsUpdater = new MetricsUpdater();
     const cpaasHealth = new CpaasHealthCheckWorker();
 
     expiry.start();
+    poolReaper.start();
     metricsUpdater.start();
     cpaasHealth.start();
     await startEventConsumers();
 
     workersStartable.push(
       { start: () => {}, stop: () => expiry.stop(), name: 'session-expiry' },
+      { start: () => {}, stop: () => poolReaper.stop(), name: 'pool-reaper' },
       { start: () => {}, stop: () => metricsUpdater.stop(), name: 'metrics-updater' },
       { start: () => {}, stop: () => cpaasHealth.stop(), name: 'cpaas-health' },
       { start: () => {}, stop: () => void stopEventConsumers(), name: 'event-consumers' },

@@ -1,7 +1,9 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import crypto from 'crypto';
+import querystring from 'querystring';
 import { z } from 'zod';
 import { getDb } from '../../config/database';
+import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { authenticate } from '../middleware/auth';
 import { tierRateLimit } from '../middleware/tier-rate-limit';
@@ -15,6 +17,13 @@ import {
   buildRedirectResponse,
   buildEmptyResponse,
 } from '../../services/africastalking/response-builder';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    /** Raw request bytes, captured only for routes in the webhook plugin scope. */
+    rawBody?: Buffer;
+  }
+}
 
 function rfc7807(slug: string, title: string, status: number, detail: string): Record<string, unknown> {
   return { type: `https://api.relavoi.com/errors/${slug}`, title, status, detail };
@@ -37,22 +46,63 @@ function generateWebhookSecret(): string {
 function deliveryLogDto(row: Record<string, unknown>): Record<string, unknown> {
   return {
     id: row.id,
-    event: row.event,
-    url: row.url,
-    statusCode: row.status_code,
+    event: row.event_type,
+    url: row.delivery_url,
+    statusCode: row.http_status,
     success: row.success,
-    attemptCount: row.attempt_count,
-    error: row.error,
-    requestedAt: row.requested_at ?? row.created_at,
-    completedAt: row.completed_at,
+    attemptCount: row.attempt_number,
+    error: row.response_body,
+    requestedAt: row.delivered_at,
+    completedAt: row.delivered_at,
   };
 }
 
+/**
+ * HMAC verification for CPaaS-originated webhooks. The signature is an HMAC of
+ * the raw request body keyed with the Africa's Talking API key. Skipped in
+ * sandbox mode (the AT sandbox does not sign callbacks); mandatory otherwise.
+ */
+function cpaasSignatureValid(req: FastifyRequest): boolean {
+  const header = req.headers['x-africastalking-signature'] ?? req.headers['x-at-signature'];
+  const signature = Array.isArray(header) ? header[0] : header;
+  if (!signature || !req.rawBody) return false;
+  return getWebhookHandler().verifySignature(
+    req.rawBody,
+    signature,
+    config.AT_API_KEY,
+    config.WEBHOOK_HMAC_ALGO,
+  );
+}
+
 export async function webhookRoutes(app: FastifyInstance): Promise<void> {
+  // Scoped override of the form-body parser: keeps the raw bytes on
+  // req.rawBody so CPaaS signatures can be verified against the exact payload
+  // the provider signed. Applies only to routes registered in this plugin.
+  if (app.hasContentTypeParser('application/x-www-form-urlencoded')) {
+    app.removeContentTypeParser('application/x-www-form-urlencoded');
+  }
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'buffer' },
+    (req, body, done) => {
+      req.rawBody = body as Buffer;
+      try {
+        done(null, { ...querystring.parse(body.toString('utf8')) });
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
+
   // ─── CPaaS-facing webhooks ────────────────────────────────────────────────────
 
   // POST /webhooks/cpaas/voice
   app.post('/webhooks/cpaas/voice', async (req, reply) => {
+    if (config.AT_ENVIRONMENT !== 'sandbox' && !cpaasSignatureValid(req)) {
+      logger.warn({ ip: req.ip }, 'CPaaS webhook signature verification failed');
+      reply.type('text/xml');
+      return reply.status(403).send(buildEmptyResponse());
+    }
     try {
       const event = parseVoiceWebhook(req.body as Record<string, string>);
       const result = await getWebhookHandler().handleVoiceWebhook(event);
@@ -101,6 +151,11 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /webhooks/cpaas/sms
   app.post('/webhooks/cpaas/sms', async (req, reply) => {
+    if (config.AT_ENVIRONMENT !== 'sandbox' && !cpaasSignatureValid(req)) {
+      logger.warn({ ip: req.ip }, 'CPaaS webhook signature verification failed');
+      reply.type('text/xml');
+      return reply.status(403).send(buildEmptyResponse());
+    }
     try {
       const event = parseSmsWebhook(req.body as Record<string, string>);
       await getWebhookHandler().handleSmsWebhook(event);
@@ -178,7 +233,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     try {
       const rows = await db('webhook_delivery_logs')
         .where({ tenant_id: tenant.id })
-        .orderBy('created_at', 'desc')
+        .orderBy('delivered_at', 'desc')
         .limit(50);
       logs = rows.map(deliveryLogDto);
     } catch {
@@ -253,9 +308,9 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
     try {
       const q = db('webhook_delivery_logs')
         .where({ tenant_id: tenant.id })
-        .orderBy('created_at', 'desc')
+        .orderBy('delivered_at', 'desc')
         .limit(parsed.data.limit + 1);
-      if (parsed.data.after) q.andWhere('id', '<', parsed.data.after);
+      if (parsed.data.after) q.andWhere('delivered_at', '<', new Date(parsed.data.after));
       const rows = await q;
       const hasMore = rows.length > parsed.data.limit;
       const page = hasMore ? rows.slice(0, parsed.data.limit) : rows;
@@ -264,7 +319,9 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         data,
         pagination: {
           count: data.length,
-          after: hasMore ? page[page.length - 1].id : null,
+          after: hasMore
+            ? new Date(page[page.length - 1].delivered_at as string).toISOString()
+            : null,
         },
       });
     } catch (err) {

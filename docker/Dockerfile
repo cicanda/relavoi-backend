@@ -24,10 +24,10 @@ COPY --from=builder --chown=relavoi:relavoi /app/dist ./dist
 COPY --chown=relavoi:relavoi package.json ./
 
 USER relavoi
-EXPOSE 3000
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --spider --quiet http://localhost:3000/v1/health || exit 1
+  CMD wget --spider --quiet http://localhost:8080/v1/health || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "dist/index.js"]

@@ -30,6 +30,25 @@ describe("Africa's Talking parsers", () => {
       expect(parsed.eventId).toBe('AT-CALL-123:ringing');
     });
 
+    it('treats an active inbound call with durationInSeconds=0 as incoming_call', () => {
+      // AT includes durationInSeconds=0 on the INITIAL inbound-call webhook.
+      // "0" is a truthy string, so the completion guard must not fire here —
+      // otherwise the very first webhook of every call is misrouted as "completed".
+      const body = {
+        sessionId: 'AT-CALL-000',
+        isActive: '1',
+        direction: 'Inbound',
+        callerNumber: '+2348012345678',
+        destinationNumber: '+2348000000001',
+        durationInSeconds: '0',
+        amount: '0.00',
+        currencyCode: 'NGN',
+      };
+      const parsed = parseVoiceWebhook(body);
+      expect(parsed.eventType).toBe('incoming_call');
+      expect(parsed.eventId).toBe('AT-CALL-000:incoming_call');
+    });
+
     it('classifies completion when duration is present', () => {
       const body = {
         sessionId: 'AT-CALL-456',

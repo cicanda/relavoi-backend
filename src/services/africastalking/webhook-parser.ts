@@ -63,8 +63,13 @@ function parseEventType(body: Record<string, string>): VoiceEventType {
   // DTMF
   if (body.dtmfDigits && body.dtmfDigits.length) return 'dtmf';
 
-  // Completion has duration or hangupCause
-  if (body.durationInSeconds || body.hangupCause || isActiveStr === '0') {
+  // Completion has ELAPSED duration (> 0), a hangupCause, or isActive=0.
+  // NB: AT sends durationInSeconds="0" on the initial inbound-call webhook, and
+  // "0" is a truthy string — so parse it as a number and only treat > 0 as
+  // "elapsed", otherwise every call's first webhook is misrouted as completed.
+  const durationSecs = Number(body.durationInSeconds ?? '');
+  const hasElapsed = Number.isFinite(durationSecs) && durationSecs > 0;
+  if (hasElapsed || body.hangupCause || isActiveStr === '0') {
     const status = (body.status ?? '').toLowerCase();
     if (status === 'noanswer' || status === 'no answer') return 'missed';
     if (status === 'failed' || status === 'busy' || status === 'aborted') return 'failed';

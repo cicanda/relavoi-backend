@@ -355,6 +355,16 @@ export class NumberPool {
       'cooldown_until',
     );
 
+    // Reconcile against live sessions: a proxy held by an ACTIVE/GRACE_PERIOD
+    // session is really in use even though proxy_numbers.status is not updated
+    // on allocate (allocation only mutates Redis). Without this, a reboot
+    // re-adds an in-use number to the available pool, so the pool counts drift
+    // and a number could be handed out from under an active session.
+    const heldRows = await db('sessions')
+      .whereIn('state', ['ACTIVE', 'GRACE_PERIOD'])
+      .distinct('proxy_number');
+    const heldProxies = new Set<string>(heldRows.map((h) => h.proxy_number as string));
+
     const regions = new Set<string>();
     const pipeline = this.redis.pipeline();
 
@@ -366,7 +376,13 @@ export class NumberPool {
       pipeline.set(`proxy:${r.number}:region`, region);
       pipeline.set(`proxy:${r.number}:provider`, r.provider ?? 'AFRICASTALKING');
 
-      if (r.status === 'AVAILABLE') {
+      // A number a live session is holding is in_use regardless of DB status,
+      // unless it has been quarantined (quarantine wins for safety).
+      if (heldProxies.has(r.number) && r.status !== 'QUARANTINED') {
+        pipeline.sadd(`pool:${region}:in_use`, r.number);
+        pipeline.srem(`pool:${region}:available`, r.number);
+        pipeline.zrem(`pool:${region}:cooldown`, r.number);
+      } else if (r.status === 'AVAILABLE') {
         pipeline.sadd(`pool:${region}:available`, r.number);
         pipeline.srem(`pool:${region}:in_use`, r.number);
         pipeline.zrem(`pool:${region}:cooldown`, r.number);

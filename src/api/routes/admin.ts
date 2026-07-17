@@ -447,33 +447,49 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       .orderBy('number');
 
     const blank = () => ({ total: 0, available: 0, inUse: 0, cooldown: 0, quarantined: 0 });
-    const totals = blank();
-    const regionMap = new Map<string, ReturnType<typeof blank> & { region: string }>();
 
-    const bump = (acc: ReturnType<typeof blank>, status: string): void => {
-      acc.total += 1;
-      if (status === 'AVAILABLE') acc.available += 1;
-      else if (status === 'IN_USE') acc.inUse += 1;
-      else if (status === 'COOLDOWN') acc.cooldown += 1;
-      else if (status === 'QUARANTINED') acc.quarantined += 1;
-    };
-
-    for (const r of numberRows) {
-      const status = r.status as string;
-      bump(totals, status);
-      const region = (r.region as string | null) ?? 'unknown';
-      let ra = regionMap.get(region);
-      if (!ra) {
-        ra = { region, ...blank() };
-        regionMap.set(region, ra);
-      }
-      bump(ra, status);
+    // Live available/inUse/cooldown come from Redis (getPoolStatus) — DB status
+    // is not updated on allocate, so a DB-based count would show an in-use
+    // number as "available". total + quarantined come from the DB (quarantined
+    // numbers are excluded from the Redis pool sets).
+    const liveByRegion = new Map<string, { available: number; inUse: number; cooldown: number }>();
+    for (const pl of pools) {
+      const cur = liveByRegion.get(pl.region) ?? { available: 0, inUse: 0, cooldown: 0 };
+      cur.available += pl.available;
+      cur.inUse += pl.inUse;
+      cur.cooldown += pl.cooldown;
+      liveByRegion.set(pl.region, cur);
     }
+    const dbByRegion = new Map<string, { total: number; quarantined: number }>();
+    for (const r of numberRows) {
+      const region = (r.region as string | null) ?? 'unknown';
+      const cur = dbByRegion.get(region) ?? { total: 0, quarantined: 0 };
+      cur.total += 1;
+      if (r.status === 'QUARANTINED') cur.quarantined += 1;
+      dbByRegion.set(region, cur);
+    }
+
+    const byRegion = Array.from(new Set([...liveByRegion.keys(), ...dbByRegion.keys()]))
+      .map((region) => {
+        const live = liveByRegion.get(region) ?? { available: 0, inUse: 0, cooldown: 0 };
+        const dbc = dbByRegion.get(region) ?? { total: 0, quarantined: 0 };
+        return { region, total: dbc.total, ...live, quarantined: dbc.quarantined };
+      })
+      .sort((a, b) => a.region.localeCompare(b.region));
+
+    const totals = byRegion.reduce((acc, r) => {
+      acc.total += r.total;
+      acc.available += r.available;
+      acc.inUse += r.inUse;
+      acc.cooldown += r.cooldown;
+      acc.quarantined += r.quarantined;
+      return acc;
+    }, blank());
 
     return reply.send({
       pools,
       totals,
-      byRegion: Array.from(regionMap.values()).sort((a, b) => a.region.localeCompare(b.region)),
+      byRegion,
       numbers: numberRows.map(proxyNumberDto),
     });
   });
@@ -513,18 +529,22 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
     const cbs: Array<{ provider: string; state: string; openedAt: string | null }> = [];
     for (const name of ['africastalking', 'twilio']) {
+      // Always surface known providers. The circuit-breaker Redis hash only
+      // exists once the breaker has recorded a request, so at rest we default
+      // to CLOSED rather than omitting the provider (which the console renders
+      // as "No providers configured").
+      let state = 'CLOSED';
+      let openedAt: string | null = null;
       try {
         const hash = await redis.hgetall(`cb:${name}`);
         if (hash && Object.keys(hash).length > 0) {
-          cbs.push({
-            provider: name,
-            state: hash.state ?? 'UNKNOWN',
-            openedAt: hash.opened_at ?? null,
-          });
+          state = hash.state ?? 'CLOSED';
+          openedAt = hash.opened_at ?? null;
         }
       } catch {
-        // skip
+        // fall back to default CLOSED state
       }
+      cbs.push({ provider: name, state, openedAt });
     }
     result.circuitBreakers = cbs;
     return reply.send(result);

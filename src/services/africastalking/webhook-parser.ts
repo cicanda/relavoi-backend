@@ -77,10 +77,13 @@ function parseEventType(body: Record<string, string>): VoiceEventType {
   }
 
   if (direction === 'inbound' && isActive) {
-    // Could be incoming or already answered; AT signals "answered" via callSessionState
+    // AT's initial inbound webhook (the one that expects a <Dial> response)
+    // arrives with callSessionState=Ringing (or empty). That IS the actionable
+    // "route this call" event — treat it as incoming_call. Only an explicit
+    // answered/in-progress state is a passive status update. (eventId dedup on
+    // sessionId:incoming_call makes AT's retries idempotent.)
     const state = (body.callSessionState ?? '').toLowerCase();
     if (state === 'answered' || state === 'inprogress' || state === 'in-progress') return 'answered';
-    if (state === 'ringing') return 'ringing';
     return 'incoming_call';
   }
 

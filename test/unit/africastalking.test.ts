@@ -11,7 +11,10 @@ import {
 
 describe("Africa's Talking parsers", () => {
   describe('parseVoiceWebhook', () => {
-    it('parses an inbound ringing call', () => {
+    it('treats an inbound active call (callSessionState=Ringing) as incoming_call', () => {
+      // AT's FIRST inbound webhook — the one it expects us to answer with a
+      // <Dial> — carries callSessionState=Ringing + isActive=1. That is the
+      // actionable "route this call now" event, NOT a passive status update.
       const body = {
         sessionId: 'AT-CALL-123',
         isActive: '1',
@@ -26,8 +29,8 @@ describe("Africa's Talking parsers", () => {
       expect(parsed.isActive).toBe(true);
       expect(parsed.callerNumber).toBe('+2348012345678');
       expect(parsed.destinationNumber).toBe('+2348000000001');
-      expect(parsed.eventType).toBe('ringing');
-      expect(parsed.eventId).toBe('AT-CALL-123:ringing');
+      expect(parsed.eventType).toBe('incoming_call');
+      expect(parsed.eventId).toBe('AT-CALL-123:incoming_call');
     });
 
     it('treats an active inbound call with durationInSeconds=0 as incoming_call', () => {

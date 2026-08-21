@@ -82,8 +82,6 @@ function callRecordDto(c: Record<string, unknown>): Record<string, unknown> {
     status: c.status,
     direction: c.direction,
     durationSeconds: c.duration_seconds,
-    cpaasCallId: c.cpaas_call_id,
-    cpaasProvider: c.cpaas_provider,
     recordingUrl: c.recording_url,
     recordingConsentPlayed: c.recording_consent_played,
     initiatedAt: c.initiated_at,
@@ -98,8 +96,6 @@ function smsRecordDto(s: Record<string, unknown>): Record<string, unknown> {
     sessionId: s.session_id,
     direction: s.direction,
     status: s.status,
-    cpaasMessageId: s.cpaas_message_id,
-    cpaasProvider: s.cpaas_provider,
     sentAt: s.sent_at ?? s.created_at,
     deliveredAt: s.delivered_at,
   };

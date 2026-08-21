@@ -28,8 +28,6 @@ function callDto(c: Record<string, unknown>): Record<string, unknown> {
     initiatedAt: c.initiated_at,
     answeredAt: c.answered_at,
     endedAt: c.ended_at,
-    cpaasCallId: c.cpaas_call_id,
-    cpaasProvider: c.cpaas_provider,
     recordingUrl: c.recording_url,
   };
 }
@@ -59,8 +57,6 @@ export async function callRoutes(app: FastifyInstance): Promise<void> {
         'cr.initiated_at',
         'cr.answered_at',
         'cr.ended_at',
-        'cr.cpaas_call_id',
-        'cr.cpaas_provider',
         'cr.recording_url',
       )
       .orderBy('cr.id', 'desc')

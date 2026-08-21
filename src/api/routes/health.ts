@@ -42,23 +42,28 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // GET /health/cpaas
+  //
+  // Tenant-facing monitoring endpoint. The underlying CPaaS vendor is an
+  // internal implementation detail, so provider entries are reported by their
+  // generic role (`primary`, `failover`) — never the vendor name. The circuit
+  // breaker Redis hashes are still keyed by the internal vendor id.
   app.get('/health/cpaas', async (_req, reply) => {
     const redis = getRedis();
     const providers: ProviderState[] = [];
 
-    const candidates = ['africastalking', 'twilio'];
-    for (const name of candidates) {
+    const roles: { name: string; cbKey: string; alwaysReport: boolean }[] = [
+      { name: 'primary', cbKey: 'africastalking', alwaysReport: true },
+      { name: 'failover', cbKey: 'twilio', alwaysReport: false },
+    ];
+
+    for (const { name, cbKey, alwaysReport } of roles) {
       try {
-        const hash = await redis.hgetall(`cb:${name}`);
+        const hash = await redis.hgetall(`cb:${cbKey}`);
         if (!hash || Object.keys(hash).length === 0) {
-          // Skip providers with no recorded state — they may not be configured.
-          if (name === 'africastalking') {
-            providers.push({
-              name,
-              state: 'CLOSED',
-              openedAt: null,
-              lastError: null,
-            });
+          // No recorded state — report the primary as healthy-by-default, skip
+          // an unconfigured failover.
+          if (alwaysReport) {
+            providers.push({ name, state: 'CLOSED', openedAt: null, lastError: null });
           }
           continue;
         }

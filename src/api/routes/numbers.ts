@@ -18,7 +18,24 @@ export async function numberRoutes(app: FastifyInstance): Promise<void> {
   // GET /numbers/pool
   app.get('/numbers/pool', { preHandler: [authenticate, tierRateLimit] }, async (_req, reply) => {
     const rows = await getNumberPool().getPoolStatus();
-    return reply.send({ pools: rows });
+    // Aggregate per-region, dropping the internal CPaaS provider dimension.
+    // Which vendor a number is provisioned through is an internal detail the
+    // tenant must not see.
+    const byRegion = new Map<
+      string,
+      { region: string; total: number; available: number; inUse: number; cooldown: number }
+    >();
+    for (const r of rows) {
+      const acc =
+        byRegion.get(r.region) ??
+        { region: r.region, total: 0, available: 0, inUse: 0, cooldown: 0 };
+      acc.total += r.total;
+      acc.available += r.available;
+      acc.inUse += r.inUse;
+      acc.cooldown += r.cooldown;
+      byRegion.set(r.region, acc);
+    }
+    return reply.send({ pools: Array.from(byRegion.values()) });
   });
 
   // POST /numbers/provision — OWNER only. Not yet implemented in MVP.

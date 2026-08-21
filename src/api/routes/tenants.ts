@@ -232,7 +232,13 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       apiKey,
       apiSecret,
       accessToken,
-      user: { id: userId, email: email.toLowerCase(), role: 'OWNER', tenantId },
+      user: {
+        id: userId,
+        email: email.toLowerCase(),
+        name: email.split('@')[0],
+        role: 'OWNER',
+        tenantId,
+      },
     });
   });
 
@@ -303,6 +309,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
         user: {
           id: user.id,
           email: user.email,
+          name: user.name,
           role: user.role,
           tenantId: tenant.id,
         },

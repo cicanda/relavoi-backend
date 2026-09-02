@@ -5,11 +5,45 @@ import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { encryptPhone, hashPhone } from '../utils/crypto';
 import { activeSessionsGauge, sessionCreatedTotal } from '../utils/metrics';
+import { TTLCache } from '../utils/cache';
 import { getNumberPool } from './number-pool';
 import { getEventBus } from './event-bus';
 
 /** E.164 (+ followed by 8-15 digits). */
 const E164_RE = /^\+[1-9]\d{7,14}$/;
+
+/**
+ * Per-tenant session defaults, read from the tenants row.
+ *
+ * Any of these may be NULL, in which case the corresponding global env default
+ * applies. Columns are declared in 001_initial_schema.ts with DB-level defaults
+ * (15 / 120 / 5), so NULL only occurs if a row explicitly clears them.
+ */
+interface TenantSessionConfig {
+  default_grace_period: number | null;
+  default_session_ttl_min: number | null;
+  cooldown_min: number | null;
+}
+
+const TENANT_CONFIG_TTL_MS = 60_000;
+
+/**
+ * Module-level so every SessionManager instance shares it. Entries are tiny and
+ * bounded by tenant count; a 60s TTL keeps session creation off the tenants
+ * table on the hot path while staying responsive to config changes. PATCH
+ * /config invalidates eagerly via invalidateTenantConfig().
+ */
+const tenantConfigCache = new TTLCache<TenantSessionConfig | null>();
+
+/** Drop a tenant's cached config so the next read reloads from Postgres. */
+export function invalidateTenantConfig(tenantId: string): void {
+  tenantConfigCache.delete(tenantId);
+}
+
+/** Test seam: clear all cached tenant config. */
+export function clearTenantConfigCache(): void {
+  tenantConfigCache.clear();
+}
 
 export type SessionState = 'PENDING' | 'ACTIVE' | 'GRACE_PERIOD' | 'EXPIRED' | 'FAILED';
 export type DirectionMode = 'BIDIRECTIONAL' | 'A_TO_B_ONLY' | 'B_TO_A_ONLY';
@@ -126,14 +160,42 @@ export class SessionManager {
   private readonly redis = getRedis();
   private readonly pool = getNumberPool();
 
+  /**
+   * Load a tenant's session defaults, memoised for TENANT_CONFIG_TTL_MS.
+   *
+   * A missing tenant is cached as null (negative caching). A database failure is
+   * NOT cached and returns null, so the caller falls back to env defaults rather
+   * than failing session creation outright.
+   */
+  private async loadTenantConfig(tenantId: string): Promise<TenantSessionConfig | null> {
+    const cached = tenantConfigCache.get(tenantId);
+    if (cached !== undefined) return cached;
+
+    let row: TenantSessionConfig | null;
+    try {
+      row =
+        (await getDb()<TenantSessionConfig>('tenants')
+          .select('default_grace_period', 'default_session_ttl_min', 'cooldown_min')
+          .where({ id: tenantId })
+          .first()) ?? null;
+    } catch (e) {
+      logger.warn(
+        { err: e, tenantId },
+        'SessionManager: tenant config load failed, falling back to env defaults',
+      );
+      return null;
+    }
+
+    tenantConfigCache.set(tenantId, row, TENANT_CONFIG_TTL_MS);
+    return row;
+  }
+
   async createSession(args: CreateSessionArgs): Promise<Session> {
     const {
       tenantId,
       agentPhone,
       customerPhone,
       metadata = {},
-      gracePeriodMinutes = config.SESSION_DEFAULT_GRACE_PERIOD_MINUTES,
-      maxDurationMinutes = config.SESSION_DEFAULT_MAX_DURATION_MINUTES,
       directionMode = 'BIDIRECTIONAL',
       recordingEnabled = false,
       consentPrompt = 'NONE',
@@ -157,6 +219,20 @@ export class SessionManager {
         'recording_enabled requires consent_prompt of DEFAULT or CUSTOM (NDPR compliance)',
       );
     }
+
+    // Resolve session durations. Precedence: explicit request value, then the
+    // tenant's configured default, then the global env default. Previously this
+    // read straight from env, so tenants.default_grace_period /
+    // default_session_ttl_min were settable via PATCH /config but never applied.
+    const tenantConfig = await this.loadTenantConfig(tenantId);
+    const gracePeriodMinutes =
+      args.gracePeriodMinutes ??
+      tenantConfig?.default_grace_period ??
+      config.SESSION_DEFAULT_GRACE_PERIOD_MINUTES;
+    const maxDurationMinutes =
+      args.maxDurationMinutes ??
+      tenantConfig?.default_session_ttl_min ??
+      config.SESSION_DEFAULT_MAX_DURATION_MINUTES;
 
     const partyAHash = hashPhone(agentPhone, tenantId);
     const partyBHash = hashPhone(customerPhone, tenantId);
@@ -344,12 +420,17 @@ export class SessionManager {
       expired_at: now,
     });
 
-    // Return proxy to pool with cooldown
+    // Return proxy to pool with cooldown. Tenant's configured cooldown_min wins
+    // over the global default, so a tenant can tune how long a number rests
+    // before it can be handed to a different pair of participants.
+    const tenantConfig = await this.loadTenantConfig(row.tenant_id);
+    const cooldownMinutes = tenantConfig?.cooldown_min ?? config.POOL_COOLDOWN_MINUTES;
+
     try {
       await this.pool.release({
         proxyNumber: row.proxy_number,
         sessionId: id,
-        cooldownMinutes: config.POOL_COOLDOWN_MINUTES,
+        cooldownMinutes,
       });
     } catch (e) {
       logger.warn({ err: e, sessionId: id, proxy: row.proxy_number }, 'SessionManager: proxy release failed');

@@ -6,6 +6,7 @@ import { getDb } from '../../config/database';
 import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { authenticate, requireUserRole } from '../middleware/auth';
+import { invalidateTenantConfig } from '../../services/session-manager';
 
 const BCRYPT_COST = 10;
 
@@ -540,6 +541,10 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       }
 
       await db('tenants').where({ id: tenant.id }).update(update);
+      // Session creation memoises tenant defaults for 60s; drop the entry so a
+      // config change takes effect on the next session rather than up to a
+      // minute later.
+      invalidateTenantConfig(tenant.id);
       const fresh = await db('tenants').where({ id: tenant.id }).first();
       return reply.send(mapTenantDto(fresh));
     },

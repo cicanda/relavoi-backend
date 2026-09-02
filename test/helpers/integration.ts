@@ -304,6 +304,10 @@ export async function seedProxyNumbers(
 export async function buildTestApp(): Promise<FastifyInstance> {
   const app = Fastify({ loggerInstance: logger, trustProxy: true });
 
+  // Mirror production body handling (empty JSON body parsed as {}).
+  const { registerJsonBodyParser } = await import('../../src/api/json-body-parser');
+  registerJsonBodyParser(app);
+
   await app.register(import('@fastify/cors'), { origin: true });
   await app.register(import('@fastify/jwt'), { secret: config.JWT_SECRET });
   await app.register(import('@fastify/formbody'));

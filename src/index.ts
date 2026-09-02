@@ -13,6 +13,10 @@ async function buildApp() {
     bodyLimit: 1_048_576, // 1 MB
   });
 
+  // ─── Body parsing ───────────────────────────────────────────────────────────
+  const { registerJsonBodyParser } = await import('./api/json-body-parser');
+  registerJsonBodyParser(app);
+
   // ─── Plugins ────────────────────────────────────────────────────────────────
   // CORS — comma-separated origins via CORS_ORIGINS env var. Falls back to the
   // standard local dev frontends (dashboard :3001, admin :3003) when unset.

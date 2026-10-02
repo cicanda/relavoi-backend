@@ -3,14 +3,44 @@ import { getDb } from '../config/database';
 import { getRedis } from '../config/redis';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
-import { encryptPhone, hashPhone } from '../utils/crypto';
+import { decryptPhone, encryptPhone, hashPhone } from '../utils/crypto';
 import { activeSessionsGauge, sessionCreatedTotal } from '../utils/metrics';
 import { TTLCache } from '../utils/cache';
+import { getAuditLogger } from './audit-logger';
 import { getNumberPool } from './number-pool';
 import { getEventBus } from './event-bus';
 
 /** E.164 (+ followed by 8-15 digits). */
 const E164_RE = /^\+[1-9]\d{7,14}$/;
+
+/**
+ * Atomically repoint a session's party B.
+ *
+ * Routing reads phone:{hash}:sessions and session:{sid}.party_b_hash. Doing the
+ * three writes separately leaves a window where the old target is already
+ * unreachable and the new one is not yet routable, so an inbound call landing in
+ * between would fail to match. One script closes it.
+ *
+ * KEYS[1] = session:{sid}            KEYS[2] = phone:{old_hash}:sessions
+ * KEYS[3] = phone:{new_hash}:sessions
+ * ARGV[1] = session_id               ARGV[2] = new_party_b_hash
+ *
+ * KEYS are prefixed by ioredis; nothing is reconstructed inside the script, so
+ * no explicit prefix argument is needed (unlike the number-pool scripts, which
+ * build keys from values they discover at runtime).
+ *
+ * Returns 1 if the session hash existed and was updated, 0 if it had already
+ * been evicted (TTL expiry or cleanup racing the swap).
+ */
+const SWAP_TARGET_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('HSET', KEYS[1], 'party_b_hash', ARGV[2])
+return 1
+`;
 
 /**
  * Per-tenant session defaults, read from the tenants row.
@@ -405,6 +435,121 @@ export class SessionManager {
     logger.info({ sessionId: id, tenantId, graceMinutes: session.gracePeriodMin }, 'Session entered grace period');
 
     return { ...session, state: 'GRACE_PERIOD', endedAt: now, expiresAt: newExpiry };
+  }
+
+  /**
+   * Repoint an active session at a new party B, keeping the proxy number.
+   *
+   * Lets one allocation serve a run of calls to different recipients (a courier
+   * working a batch of drops) instead of burning a number per recipient and
+   * waiting out the cooldown between them.
+   *
+   * Idempotent: swapping to the number already in place is a no-op and writes
+   * neither an audit entry nor an event.
+   */
+  async swapTarget(id: string, tenantId: string, newCustomerPhone: string): Promise<Session | null> {
+    if (!E164_RE.test(newCustomerPhone)) {
+      throw err('INVALID_PHONE', 400, 'customerPhone must be valid E.164');
+    }
+
+    const db = getDb();
+    const row = await db<DbSessionRow>('sessions').where({ id, tenant_id: tenantId }).first();
+    if (!row) return null;
+
+    if (row.state !== 'ACTIVE' && row.state !== 'GRACE_PERIOD') {
+      throw err(
+        'SESSION_NOT_SWAPPABLE',
+        409,
+        `Session is ${row.state}; only ACTIVE or GRACE_PERIOD sessions can be retargeted.`,
+      );
+    }
+
+    // Decrypt rather than compare hashes: hashPhone is salted per tenant, so
+    // hashing the input would also work, but decrypting keeps the comparison
+    // readable and lets us surface the agent/target clash precisely.
+    const agentPhone = decryptPhone(row.party_a_phone_enc, tenantId);
+    if (agentPhone === newCustomerPhone) {
+      throw err('SAME_AS_AGENT', 422, 'Target phone cannot be the same as the agent phone');
+    }
+
+    const currentCustomer = decryptPhone(row.party_b_phone_enc, tenantId);
+    if (currentCustomer === newCustomerPhone) {
+      // Already pointed here. Return the session untouched.
+      return rowToSession(row);
+    }
+
+    const newHash = hashPhone(newCustomerPhone, tenantId);
+    const oldHash = row.party_b_phone_hash;
+
+    // Overlap: would this proxy then be serving two live sessions that share a
+    // participant? Only the incoming target can introduce a clash — party A is
+    // unchanged and was cleared when the number was allocated. The session being
+    // swapped is skipped, since it is itself on this proxy.
+    const siblings = await this.redis.smembers(`proxy:${row.proxy_number}:sessions`);
+    for (const sid of siblings) {
+      if (sid === id) continue;
+      const s = await this.redis.hgetall(`session:${sid}`);
+      if (!s || !s.id) continue;
+      if (s.state !== 'ACTIVE' && s.state !== 'GRACE_PERIOD') continue;
+      if (s.party_a_hash === newHash || s.party_b_hash === newHash) {
+        throw err(
+          'TARGET_CONFLICT',
+          409,
+          'Target phone conflicts with another active session on this proxy number.',
+        );
+      }
+    }
+
+    const newEnc = encryptPhone(newCustomerPhone, tenantId);
+
+    await db('sessions')
+      .where({ id, tenant_id: tenantId })
+      .update({ party_b_phone_enc: newEnc, party_b_phone_hash: newHash });
+
+    const updated = (await this.redis.eval(
+      SWAP_TARGET_SCRIPT,
+      3,
+      `session:${id}`,
+      `phone:${oldHash}:sessions`,
+      `phone:${newHash}:sessions`,
+      id,
+      newHash,
+    )) as number;
+
+    if (updated !== 1) {
+      // Postgres is authoritative and already updated; the cache entry was gone,
+      // so rebuild the routing keys directly rather than leaving a hole.
+      logger.warn({ sessionId: id }, 'SessionManager.swapTarget: session cache missing, repairing');
+      await this.redis.srem(`phone:${oldHash}:sessions`, id);
+      await this.redis.sadd(`phone:${newHash}:sessions`, id);
+    }
+
+    void getAuditLogger().log({
+      actorType: 'tenant',
+      actorId: tenantId,
+      action: 'session.target_swapped',
+      resourceType: 'session',
+      resourceId: id,
+      // Hashes only. The audit trail proves a swap happened and correlates with
+      // call records; it must never carry a subscriber number.
+      metadata: { previousPartyBHash: oldHash, newPartyBHash: newHash },
+    });
+
+    void getEventBus()
+      .publish('session.target_swapped', {
+        tenantId,
+        sessionId: id,
+        proxyNumber: row.proxy_number,
+        timestamp: new Date().toISOString(),
+      })
+      .catch((e) =>
+        logger.warn({ err: e, sessionId: id }, 'SessionManager: publish session.target_swapped failed'),
+      );
+
+    logger.info({ sessionId: id, tenantId }, 'Session target swapped');
+
+    const fresh = await db<DbSessionRow>('sessions').where({ id, tenant_id: tenantId }).first();
+    return fresh ? rowToSession(fresh) : null;
   }
 
   async expireSession(id: string): Promise<boolean> {

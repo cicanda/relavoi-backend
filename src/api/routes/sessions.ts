@@ -32,6 +32,10 @@ const listQuerySchema = z.object({
   after: z.string().optional(),
 });
 
+const targetSwapSchema = z
+  .object({ customerPhone: z.string().min(1) })
+  .strict();
+
 const verifyQuerySchema = z.object({
   userPhone: z.string().regex(E164, 'userPhone must be E.164'),
   tenantId: z.string().optional(),
@@ -289,6 +293,51 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
         .where({ id: req.params.id, tenant_id: tenant.id })
         .first();
       return reply.send(sessionDto(fresh));
+    },
+  );
+
+  // PATCH /sessions/:id/target — repoint an active session at a new party B
+  app.patch<{ Params: { id: string } }>(
+    '/sessions/:id/target',
+    { preHandler: [authenticate, tierRateLimit] },
+    async (req, reply) => {
+      const tenant = req.tenant!;
+      const parsed = targetSwapSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+
+      try {
+        const result = await getSessionManager().swapTarget(
+          req.params.id,
+          tenant.id,
+          parsed.data.customerPhone,
+        );
+        if (!result) {
+          return reply
+            .status(404)
+            .type('application/problem+json')
+            .send(rfc7807('not-found', 'Not Found', 404, 'Session not found.'));
+        }
+        return reply.send(sessionDto(result));
+      } catch (e) {
+        const se = e as { statusCode?: number; code?: string; message?: string };
+        const status = se.statusCode ?? 400;
+        const slug =
+          status === 409 ? 'target-conflict' : status === 422 ? 'invalid-target' : 'validation';
+        const title =
+          status === 409 ? 'Conflict' : status === 422 ? 'Unprocessable Entity' : 'Bad Request';
+        if (status >= 500) {
+          logger.error({ err: e, sessionId: req.params.id }, 'target swap failed');
+        }
+        return reply
+          .status(status)
+          .type('application/problem+json')
+          .send(rfc7807(slug, title, status, se.message ?? 'target swap failed'));
+      }
     },
   );
 

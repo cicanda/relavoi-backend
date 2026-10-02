@@ -218,6 +218,7 @@ export class CallRouter {
       direction: matched.callerIsA ? 'A_TO_B' : 'B_TO_A',
       cpaasCallId: args.eventId,
       recordingConsentPlayed: action === 'consent_then_forward',
+      partyBHash: session.party_b_hash as string | undefined,
     });
     void this.bumpSessionCallCount(session.id as string);
 
@@ -331,6 +332,12 @@ export class CallRouter {
     direction: 'A_TO_B' | 'B_TO_A';
     cpaasCallId: string;
     recordingConsentPlayed: boolean;
+    /**
+     * Party B in force when the call was routed. A session can be retargeted
+     * (PATCH /sessions/:id/target), so session_id alone no longer says who was
+     * reached; capture it per call.
+     */
+    partyBHash?: string;
   }): Promise<void> {
     try {
       const db = getDb();
@@ -342,6 +349,7 @@ export class CallRouter {
         direction: args.direction,
         status: 'RINGING',
         recording_consent_played: args.recordingConsentPlayed,
+        party_b_phone_hash: args.partyBHash ?? null,
         initiated_at: new Date(),
       });
     } catch (e) {

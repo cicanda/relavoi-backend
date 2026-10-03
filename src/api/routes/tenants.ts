@@ -46,6 +46,17 @@ function mapTenantDto(t: Record<string, unknown>): Record<string, unknown> {
     recordingConsentMode: t.recording_consent_mode,
     recordingConsentAudioUrl: t.recording_consent_audio_url ?? null,
     pushConfig: t.push_config ?? {},
+    // Moved off signup; the dashboard needs them readable to render the
+    // Workspace Setup form it now edits them through.
+    workspaceSlug: t.workspace_slug ?? null,
+    country: t.country ?? null,
+    industry: t.industry ?? null,
+    requestedPoolSize: t.requested_pool_size ?? null,
+    defaultSessionTtlMin: t.default_session_ttl_min ?? null,
+    cooldownMin: t.cooldown_min ?? null,
+    // True once the tenant has asked for credentials; signup no longer mints
+    // them, so the dashboard must be able to tell "none yet" from "has keys".
+    hasApiCredentials: Boolean(t.api_key_hash),
     createdAt: t.created_at,
     updatedAt: t.updated_at,
   };
@@ -60,9 +71,20 @@ const tokenBodySchema = z.object({
 const signupBodySchema = z.object({
   companyName: z.string().min(1).max(255),
   email: z.string().email(),
-  password: z.string().min(8).max(128),
+  password: z.string().min(12, 'Password must be at least 12 characters').max(128),
+  name: z.string().min(1).max(255),
+  // Onboarding metadata. Signup no longer asks for any of it -- a developer
+  // should reach the dashboard, not a survey -- but the fields are still
+  // accepted so an integrator who has the answers can send them up front.
+  // Anything omitted stays null and is filled in later from Settings.
+  workspaceSlug: z.string().max(100).optional(),
+  country: z.string().length(2).optional(),
+  industry: z.string().max(50).optional(),
   companySize: z.string().optional(),
   useCase: z.string().optional(),
+  requestedPoolSize: z.number().int().positive().optional(),
+  defaultSessionTtlMin: z.number().int().positive().optional(),
+  cooldownMin: z.number().int().nonnegative().optional(),
 });
 
 const loginBodySchema = z.object({
@@ -95,6 +117,14 @@ const configPatchSchema = z
     recordingConsentMode: z.enum(['DEFAULT', 'CUSTOM', 'NONE']).optional(),
     recordingConsentAudioUrl: z.string().url().nullable().optional(),
     pushConfig: z.record(z.unknown()).optional(),
+    // Moved off the signup form. Without these the fields would be writable
+    // nowhere, since signup is the only place that ever set them.
+    workspaceSlug: z.string().max(100).nullable().optional(),
+    country: z.string().length(2).nullable().optional(),
+    industry: z.string().max(50).nullable().optional(),
+    requestedPoolSize: z.number().int().positive().nullable().optional(),
+    defaultSessionTtlMin: z.number().int().positive().optional(),
+    cooldownMin: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -153,7 +183,13 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  // POST /auth/signup — self-service signup, returns plaintext API creds ONCE
+  // POST /auth/signup — self-service signup.
+  //
+  // Deliberately does NOT mint API credentials. Signup asks four questions and
+  // drops the developer on the dashboard; keys are issued on request from
+  // POST /auth/rotate-key once they are actually integrating. That keeps a
+  // long-lived secret from being handed to someone who is only looking around,
+  // and keeps it out of this response body and anything that logs it.
   app.post('/auth/signup', async (req, reply) => {
     const parsed = signupBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -162,7 +198,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
         .type('application/problem+json')
         .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
     }
-    const { companyName, email, password } = parsed.data;
+    const { companyName, email, password, name } = parsed.data;
 
     const db = getDb();
 
@@ -174,11 +210,6 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
         .send(rfc7807('conflict', 'Conflict', 409, 'Email already registered.'));
     }
 
-    const apiKey = generateApiKey();
-    const apiSecret = generateApiSecret();
-
-    const apiKeyHash = sha256(apiKey);
-    const apiSecretHash = await bcrypt.hash(apiSecret, BCRYPT_COST);
     const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
 
     let tenantId = '';
@@ -186,13 +217,24 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
 
     try {
       await db.transaction(async (trx) => {
+        // Onboarding metadata is optional; undefined stays NULL and is filled
+        // in later from Settings. api_key_hash / api_secret_hash are left NULL
+        // (see migration 006) until the tenant asks for credentials.
         const [tenant] = await trx('tenants')
           .insert({
             name: companyName,
-            api_key_hash: apiKeyHash,
-            api_secret_hash: apiSecretHash,
             tier: 'STARTER',
             billing_email: email.toLowerCase(),
+            workspace_slug: parsed.data.workspaceSlug ?? null,
+            country: parsed.data.country ?? null,
+            industry: parsed.data.industry ?? null,
+            requested_pool_size: parsed.data.requestedPoolSize ?? null,
+            ...(parsed.data.defaultSessionTtlMin !== undefined
+              ? { default_session_ttl_min: parsed.data.defaultSessionTtlMin }
+              : {}),
+            ...(parsed.data.cooldownMin !== undefined
+              ? { cooldown_min: parsed.data.cooldownMin }
+              : {}),
           })
           .returning(['id']);
         tenantId = tenant.id;
@@ -202,7 +244,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
             tenant_id: tenantId,
             email: email.toLowerCase(),
             password_hash: passwordHash,
-            name: email.split('@')[0],
+            name,
             role: 'OWNER',
             is_active: true,
           })
@@ -228,18 +270,18 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       { expiresIn: config.JWT_EXPIRY },
     );
 
+    const tenantRow = await db('tenants').where({ id: tenantId }).first();
+
     return reply.status(201).send({
-      tenantId,
-      apiKey,
-      apiSecret,
       accessToken,
       user: {
         id: userId,
         email: email.toLowerCase(),
-        name: email.split('@')[0],
+        name,
         role: 'OWNER',
         tenantId,
       },
+      tenant: tenantRow ? mapTenantDto(tenantRow) : { id: tenantId, name: companyName, tier: 'STARTER' },
     });
   });
 
@@ -518,6 +560,13 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       if (body.recordingConsentAudioUrl !== undefined)
         update.recording_consent_audio_url = body.recordingConsentAudioUrl;
       if (body.pushConfig !== undefined) update.push_config = JSON.stringify(body.pushConfig);
+      if (body.workspaceSlug !== undefined) update.workspace_slug = body.workspaceSlug;
+      if (body.country !== undefined) update.country = body.country;
+      if (body.industry !== undefined) update.industry = body.industry;
+      if (body.requestedPoolSize !== undefined) update.requested_pool_size = body.requestedPoolSize;
+      if (body.defaultSessionTtlMin !== undefined)
+        update.default_session_ttl_min = body.defaultSessionTtlMin;
+      if (body.cooldownMin !== undefined) update.cooldown_min = body.cooldownMin;
 
       // Invariant: recordingEnabled=true requires consentMode != NONE
       const effectiveRecording =

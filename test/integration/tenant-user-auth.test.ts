@@ -38,7 +38,7 @@ describe('tenant user auth (integration)', () => {
     await disconnectRedis();
   });
 
-  it('(a) Signup creates tenant and user', async () => {
+  it('(a) Signup creates tenant and OWNER user from four fields', async () => {
     const email = `signup-${Date.now()}@example.test`;
     const res = await app.inject({
       method: 'POST',
@@ -47,29 +47,117 @@ describe('tenant user auth (integration)', () => {
         companyName: `Signup Test Co ${Date.now()}`,
         email,
         password: 'verystrongpw123',
+        name: 'Kay Tester',
       },
     });
     expect([200, 201]).toContain(res.statusCode);
     const body = res.json() as {
-      tenantId: string;
-      apiKey: string;
-      apiSecret: string;
       accessToken: string;
+      user: { id: string; email: string; name: string; role: string; tenantId: string };
+      tenant: { id: string; tier: string; hasApiCredentials: boolean };
     };
-    expect(body.tenantId).toBeTruthy();
-    expect(body.apiKey).toBeTruthy();
-    expect(body.apiSecret).toBeTruthy();
     expect(body.accessToken).toBeTruthy();
+    expect(body.user.role).toBe('OWNER');
+    expect(body.user.name).toBe('Kay Tester');
+    expect(body.tenant.tier).toBe('STARTER');
 
-    // Verify in DB
-    const tenantRow = await db('tenants').where({ id: body.tenantId }).first();
+    // Credentials are issued later, from the dashboard.
+    expect(body).not.toHaveProperty('apiKey');
+    expect(body).not.toHaveProperty('apiSecret');
+    expect(body.tenant.hasApiCredentials).toBe(false);
+
+    const tenantRow = await db('tenants').where({ id: body.user.tenantId }).first();
     expect(tenantRow).toBeTruthy();
     expect(tenantRow.billing_email).toBe(email);
+    expect(tenantRow.api_key_hash).toBeNull();
+    expect(tenantRow.api_secret_hash).toBeNull();
+    // Nothing was invented for the questions signup stopped asking.
+    expect(tenantRow.industry).toBeNull();
+    expect(tenantRow.requested_pool_size).toBeNull();
 
     const userRow = await db('tenant_users').where({ email }).first();
-    expect(userRow).toBeTruthy();
     expect(userRow.role).toBe('OWNER');
-    expect(userRow.tenant_id).toBe(body.tenantId);
+    expect(userRow.name).toBe('Kay Tester');
+    expect(userRow.tenant_id).toBe(body.user.tenantId);
+  });
+
+  it('(a2) Signup rejects a missing name and a password under 12 characters', async () => {
+    const base = {
+      companyName: 'Short Co',
+      email: `short-${Date.now()}@example.test`,
+      password: 'verystrongpw123',
+      name: 'Kay',
+    };
+    const noName = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signup',
+      payload: { ...base, name: undefined },
+    });
+    expect(noName.statusCode).toBe(400);
+
+    const shortPw = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signup',
+      payload: { ...base, password: 'elevenchar1' }, // 11
+    });
+    expect(shortPw.statusCode).toBe(400);
+  });
+
+  it('(a3) A tenant without credentials can mint them, then authenticate', async () => {
+    const email = `keys-${Date.now()}@example.test`;
+    const signup = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signup',
+      payload: { companyName: `Keys Co ${Date.now()}`, email, password: 'verystrongpw123', name: 'Kay' },
+    });
+    const { accessToken, user } = signup.json() as {
+      accessToken: string;
+      user: { tenantId: string };
+    };
+
+    const rotated = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/rotate-key',
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    expect(rotated.statusCode).toBe(200);
+    const { apiKey, apiSecret } = rotated.json() as { apiKey: string; apiSecret: string };
+    expect(apiKey).toMatch(/^rk_live_/);
+
+    // Those credentials now work against the SDK token endpoint.
+    const token = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/token',
+      payload: { apiKey, apiSecret },
+    });
+    expect(token.statusCode).toBe(200);
+    expect((token.json() as { accessToken: string }).accessToken).toBeTruthy();
+
+    const row = await db('tenants').where({ id: user.tenantId }).first();
+    expect(row.api_key_hash).not.toBeNull();
+  });
+
+  it('(a4) Optional onboarding metadata is stored when sent', async () => {
+    const email = `meta-${Date.now()}@example.test`;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signup',
+      payload: {
+        companyName: `Meta Co ${Date.now()}`,
+        email,
+        password: 'verystrongpw123',
+        name: 'Kay',
+        industry: 'Delivery',
+        country: 'NG',
+        requestedPoolSize: 25,
+      },
+    });
+    expect([200, 201]).toContain(res.statusCode);
+    const { user } = res.json() as { user: { tenantId: string } };
+    const row = await db('tenants').where({ id: user.tenantId }).first();
+    expect(row.industry).toBe('Delivery');
+    expect(row.country).toBe('NG');
+    expect(row.requested_pool_size).toBe(25);
   });
 
   it('(b) Dashboard login returns user and tenant info', async () => {
@@ -207,10 +295,11 @@ describe('tenant user auth (integration)', () => {
         companyName: `Audit Co ${Date.now()}`,
         email,
         password: 'strongpw1234',
+        name: 'Audit Tester',
       },
     });
     expect([200, 201]).toContain(signup.statusCode);
-    const body = signup.json() as { tenantId: string };
+    const body = { tenantId: (signup.json() as { user: { tenantId: string } }).user.tenantId };
 
     // Query audit_log via the actual column name (resource_id holds the tenant id
     // when the resource is a tenant). Lenient: we accept 0 entries (audit logging

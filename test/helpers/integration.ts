@@ -18,7 +18,7 @@ import knexConfig from '../../src/config/knexfile';
 
 export const TEST_TENANT_ID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 export const TEST_TENANT_NAME = 'Chowdeck Test';
-export const TEST_API_KEY = 'sk_test_relavoi_dev_0123456789abcdef';
+export const TEST_API_KEY = 'rk_test_relavoi_dev_0123456789abcdef';
 export const TEST_API_SECRET = 'secret_test_relavoi_dev_fedcba9876543210';
 export const TEST_USER_EMAIL = 'dev@chowdeck.test';
 export const TEST_USER_PASSWORD = 'password123';

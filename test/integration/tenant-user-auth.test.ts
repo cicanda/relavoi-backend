@@ -122,7 +122,8 @@ describe('tenant user auth (integration)', () => {
     });
     expect(rotated.statusCode).toBe(200);
     const { apiKey, apiSecret } = rotated.json() as { apiKey: string; apiSecret: string };
-    expect(apiKey).toMatch(/^rk_live_/);
+    // A new workspace is sandboxed, so rotation mints TEST credentials.
+    expect(apiKey).toMatch(/^rk_test_/);
 
     // Those credentials now work against the SDK token endpoint.
     const token = await app.inject({

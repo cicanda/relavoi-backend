@@ -138,7 +138,9 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         case 'redirect':
           return reply.status(200).send(buildRedirectResponse(decision.destination ?? ''));
         case 'play_message':
-          return reply.status(200).send(buildPlayMessageResponse(decision.audioUrl ?? ''));
+          return reply
+            .status(200)
+            .send(buildPlayMessageResponse(decision.audioUrl ?? '', decision.message));
         default:
           return reply.status(200).send(buildEmptyResponse());
       }

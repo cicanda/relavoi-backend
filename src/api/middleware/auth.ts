@@ -6,16 +6,28 @@ import { logger } from '../../utils/logger';
 // it here. req.tenant + req.operator are our own additions.
 declare module 'fastify' {
   interface FastifyRequest {
-    tenant?: { id: string; tier: string };
+    tenant?: { id: string; tier: string; mode: 'sandbox' | 'live' };
     operator?: { id: string; role: 'ROOT' | 'SRE' | 'SUPPORT' };
   }
 }
 
+/**
+ * Mode asserted by the token. Dashboard-user tokens carry none: a human in the
+ * console is not making metered API calls, so they inherit the tenant's own
+ * mode wherever it matters. API tokens always carry the mode of the key that
+ * minted them, and absence on those is treated as sandbox -- the safe default,
+ * since sandbox never reaches the carrier or bills anyone.
+ */
+function tokenMode(payload: { mode?: 'sandbox' | 'live' }): 'sandbox' | 'live' {
+  return payload.mode === 'live' ? 'live' : 'sandbox';
+}
+
 // Raw JWT payload union — what we sign and what jwtVerify decodes.
 export type JwtPayload =
-  | { tenantId: string; tier: string }
+  | { tenantId: string; tier: string; mode?: 'sandbox' | 'live' }
   | {
       type: 'tenant_user';
+      mode?: 'sandbox' | 'live';
       tenantId: string;
       tier: string;
       userId: string;
@@ -76,7 +88,7 @@ export async function authenticate(req: FastifyRequest, reply: FastifyReply): Pr
   }
 
   if ('type' in payload && payload.type === 'tenant_user') {
-    req.tenant = { id: payload.tenantId, tier: payload.tier };
+    req.tenant = { id: payload.tenantId, tier: payload.tier, mode: tokenMode(payload) };
     req.user = { id: payload.userId, role: payload.role };
     return;
   }
@@ -86,7 +98,7 @@ export async function authenticate(req: FastifyRequest, reply: FastifyReply): Pr
   if (!('tenantId' in payload) || !payload.tenantId) {
     return void unauthorized(reply, 'Token missing tenantId claim.');
   }
-  req.tenant = { id: payload.tenantId, tier: payload.tier };
+  req.tenant = { id: payload.tenantId, tier: payload.tier, mode: tokenMode(payload) };
 }
 
 // ─── requireUserRole ────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { authenticate, requireUserRole } from '../middleware/auth';
 import { invalidateTenantConfig } from '../../services/session-manager';
+import { getAuditLogger } from '../../services/audit-logger';
 
 const BCRYPT_COST = 10;
 
@@ -15,12 +16,34 @@ function rfc7807(slug: string, title: string, status: number, detail: string): R
   return { type: `https://api.relavoi.com/errors/${slug}`, title, status, detail };
 }
 
-function generateApiKey(): string {
-  return `rk_live_${crypto.randomBytes(24).toString('hex')}`;
+export type TenantMode = 'sandbox' | 'live';
+
+/**
+ * Credentials carry their mode in the prefix. Auth reads it to decide which
+ * stored pair to check, so a test key can never be mistaken for a live one
+ * even if the hashes were somehow transposed.
+ */
+function generateApiKey(mode: TenantMode): string {
+  const tag = mode === 'live' ? 'live' : 'test';
+  return `rk_${tag}_${crypto.randomBytes(24).toString('hex')}`;
 }
 
-function generateApiSecret(): string {
-  return `rs_${crypto.randomBytes(32).toString('hex')}`;
+function generateApiSecret(mode: TenantMode): string {
+  const tag = mode === 'live' ? 'live' : 'test';
+  return `rs_${tag}_${crypto.randomBytes(32).toString('hex')}`;
+}
+
+/**
+ * Mode implied by a presented key. Secrets issued before this change were
+ * `rs_<hex>` with no tag; only the KEY prefix is ever used to route the lookup,
+ * so those remain verifiable against the live pair they belong to.
+ */
+function modeFromKey(apiKey: string): TenantMode {
+  if (apiKey.startsWith('rk_test_')) return 'sandbox';
+  // rk_live_, and anything predating this scheme. Migration 007 moved every
+  // pre-existing credential into the live columns, so an unprefixed legacy key
+  // must be checked there or it would stop working the moment this shipped.
+  return 'live';
 }
 
 function sha256(s: string): string {
@@ -30,6 +53,63 @@ function sha256(s: string): string {
 function generateTempPassword(): string {
   // 16 chars from base64url
   return crypto.randomBytes(12).toString('base64url');
+}
+
+/**
+ * Mint a credential pair for one mode and store its hashes in that mode's
+ * columns. The plaintext is returned to the caller once and never persisted.
+ */
+async function issueKeys(
+  db: ReturnType<typeof getDb>,
+  tenantId: string,
+  mode: TenantMode,
+): Promise<{ apiKey: string; apiSecret: string }> {
+  const apiKey = generateApiKey(mode);
+  const apiSecret = generateApiSecret(mode);
+  const update =
+    mode === 'live'
+      ? {
+          live_api_key_hash: sha256(apiKey),
+          live_api_secret_hash: await bcrypt.hash(apiSecret, BCRYPT_COST),
+          updated_at: new Date(),
+        }
+      : {
+          api_key_hash: sha256(apiKey),
+          api_secret_hash: await bcrypt.hash(apiSecret, BCRYPT_COST),
+          updated_at: new Date(),
+        };
+  await db('tenants').where({ id: tenantId }).update(update);
+  return { apiKey, apiSecret };
+}
+
+/**
+ * What a workspace must have before it can spend real money.
+ *
+ * A sandbox session is the meaningful gate: it proves the integration actually
+ * works end to end, so the first live call is not also the first call ever
+ * attempted. The webhook URL is required because without it the tenant cannot
+ * observe what their live traffic is doing.
+ */
+async function liveRequirements(
+  db: ReturnType<typeof getDb>,
+  tenantId: string,
+): Promise<Array<{ key: string; label: string; met: boolean }>> {
+  const row = await db('tenants').where({ id: tenantId }).first();
+  const [{ count }] = await db('sessions')
+    .where({ tenant_id: tenantId, mode: 'sandbox' })
+    .count({ count: '*' });
+  return [
+    {
+      key: 'sandbox_session',
+      label: 'at least one sandbox session has been created',
+      met: Number(count) > 0,
+    },
+    {
+      key: 'webhook_url',
+      label: 'a webhook URL is configured',
+      met: Boolean(row?.webhook_url),
+    },
+  ];
 }
 
 function mapTenantDto(t: Record<string, unknown>): Record<string, unknown> {
@@ -56,7 +136,10 @@ function mapTenantDto(t: Record<string, unknown>): Record<string, unknown> {
     cooldownMin: t.cooldown_min ?? null,
     // True once the tenant has asked for credentials; signup no longer mints
     // them, so the dashboard must be able to tell "none yet" from "has keys".
-    hasApiCredentials: Boolean(t.api_key_hash),
+    mode: t.mode ?? 'sandbox',
+    hasSandboxKeys: Boolean(t.api_key_hash),
+    hasLiveKeys: Boolean(t.live_api_key_hash),
+    hasApiCredentials: Boolean(t.api_key_hash || t.live_api_key_hash),
     createdAt: t.created_at,
     updatedAt: t.updated_at,
   };
@@ -102,6 +185,10 @@ const changePasswordSchema = z.object({
   newPassword: z.string().min(8).max(128),
 });
 
+const keyGenerateSchema = z.object({
+  mode: z.enum(['sandbox', 'live']),
+});
+
 const configPatchSchema = z
   .object({
     name: z.string().min(1).max(255).optional(),
@@ -142,10 +229,15 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
 
     const db = getDb();
 
-    // api_key_hash is SHA-256(apiKey) — index lookup, O(1).
-    // api_secret_hash is bcrypt(apiSecret) — verified after the row is located.
+    // The prefix picks the column pair; the hash picks the row. A key with no
+    // recognised prefix cannot be placed in either mode, so it is rejected
+    // outright rather than guessed at.
+    const mode = modeFromKey(parsed.data.apiKey);
+    const keyColumn = mode === 'live' ? 'live_api_key_hash' : 'api_key_hash';
+    const secretColumn = mode === 'live' ? 'live_api_secret_hash' : 'api_secret_hash';
+
     const apiKeyHash = sha256(parsed.data.apiKey);
-    const matched = await db('tenants').where({ api_key_hash: apiKeyHash }).first();
+    const matched = await db('tenants').where({ [keyColumn]: apiKeyHash }).first();
 
     if (!matched) {
       return reply
@@ -156,7 +248,7 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
 
     let secretOk = false;
     try {
-      secretOk = await bcrypt.compare(parsed.data.apiSecret, matched.api_secret_hash);
+      secretOk = await bcrypt.compare(parsed.data.apiSecret, matched[secretColumn]);
     } catch {
       secretOk = false;
     }
@@ -171,8 +263,11 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     db('tenants').where({ id: matched.id }).update({ api_key_last_used_at: new Date() })
       .catch((err) => logger.warn({ err, tenantId: matched.id }, 'failed to update api_key_last_used_at'));
 
+    // The token carries the mode of the key that minted it, not the tenant's
+    // current mode: a live tenant experimenting with its test key must still
+    // get sandbox behaviour for that request.
     const accessToken = app.jwt.sign(
-      { tenantId: matched.id as string, tier: (matched.tier as string) ?? 'STARTER' },
+      { tenantId: matched.id as string, tier: (matched.tier as string) ?? 'STARTER', mode },
       { expiresIn: config.JWT_EXPIRY },
     );
 
@@ -262,6 +357,8 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     const accessToken = app.jwt.sign(
       {
         type: 'tenant_user',
+        // New tenants always start sandboxed.
+        mode: 'sandbox',
         tenantId,
         tier: 'STARTER',
         userId,
@@ -339,6 +436,8 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
       const accessToken = app.jwt.sign(
         {
           type: 'tenant_user',
+          // Console sessions inherit whatever mode the workspace is in.
+          mode: tenant.mode === 'live' ? 'live' : 'sandbox',
           tenantId: tenant.id,
           tier: tenant.tier ?? 'STARTER',
           userId: user.id,
@@ -356,12 +455,9 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
           role: user.role,
           tenantId: tenant.id,
         },
-        tenant: {
-          id: tenant.id,
-          name: tenant.name,
-          tier: tenant.tier ?? 'STARTER',
-          status: tenant.status ?? 'ACTIVE',
-        },
+        // Full DTO: the dashboard reads mode (and the workspace fields) from
+        // the login payload, so a partial object silently mis-renders the badge.
+        tenant: mapTenantDto(tenant),
       });
     },
   );
@@ -466,24 +562,134 @@ export async function tenantRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: [authenticate, requireUserRole('OWNER')] },
     async (req, reply) => {
       const tenant = req.tenant!;
-      const apiKey = generateApiKey();
-      const apiSecret = generateApiSecret();
-      const apiKeyHash = sha256(apiKey);
-      const apiSecretHash = await bcrypt.hash(apiSecret, BCRYPT_COST);
-
       const db = getDb();
-      await db('tenants')
-        .where({ id: tenant.id })
-        .update({
-          api_key_hash: apiKeyHash,
-          api_secret_hash: apiSecretHash,
-          updated_at: new Date(),
-        });
+      const row = await db('tenants').where({ id: tenant.id }).first();
+      // Rotate the pair matching the tenant's current mode. Retained for
+      // backward compatibility; POST /auth/keys/generate is the explicit form.
+      const mode: TenantMode = row?.mode === 'live' ? 'live' : 'sandbox';
+      const issued = await issueKeys(db, tenant.id, mode);
 
-      logger.info({ tenantId: tenant.id, by: req.user?.id }, 'tenant API key rotated');
-      return reply.send({ apiKey, apiSecret });
+      logger.info({ tenantId: tenant.id, mode, by: req.user?.id }, 'tenant API key rotated');
+      return reply.send({ ...issued, mode });
     },
   );
+
+  // POST /auth/keys/generate — mint a credential pair for one mode (OWNER only)
+  app.post(
+    '/auth/keys/generate',
+    { preHandler: [authenticate, requireUserRole('OWNER')] },
+    async (req, reply) => {
+      const parsed = keyGenerateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .status(400)
+          .type('application/problem+json')
+          .send(rfc7807('validation', 'Bad Request', 400, parsed.error.message));
+      }
+      const tenant = req.tenant!;
+      const db = getDb();
+      const row = await db('tenants').where({ id: tenant.id }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Tenant not found.'));
+      }
+
+      // Sandbox keys are always available. Live keys require the workspace to
+      // have been activated first -- otherwise "activation" would be a label
+      // with nothing behind it, since a live key is what actually unlocks
+      // spending.
+      if (parsed.data.mode === 'live' && row.mode !== 'live') {
+        return reply
+          .status(409)
+          .type('application/problem+json')
+          .send(
+            rfc7807(
+              'live-not-activated',
+              'Conflict',
+              409,
+              'Workspace is in sandbox mode. Activate live mode before generating live keys.',
+            ),
+          );
+      }
+
+      const issued = await issueKeys(db, tenant.id, parsed.data.mode);
+      void getAuditLogger().log({
+        actorType: 'tenant',
+        actorId: tenant.id,
+        action: 'keys.generated',
+        resourceType: 'tenant',
+        resourceId: tenant.id,
+        metadata: { mode: parsed.data.mode, by: req.user?.id },
+      });
+      logger.info({ tenantId: tenant.id, mode: parsed.data.mode }, 'API keys generated');
+      return reply.send({ ...issued, mode: parsed.data.mode });
+    },
+  );
+
+  // POST /auth/keys/activate-live — flip a workspace out of sandbox (OWNER only)
+  app.post(
+    '/auth/keys/activate-live',
+    { preHandler: [authenticate, requireUserRole('OWNER')] },
+    async (req, reply) => {
+      const tenant = req.tenant!;
+      const db = getDb();
+      const row = await db('tenants').where({ id: tenant.id }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Tenant not found.'));
+      }
+
+      if (row.mode === 'live') {
+        // Idempotent: already live is a success, not an error.
+        return reply.send({ mode: 'live', requirements: await liveRequirements(db, tenant.id) });
+      }
+
+      const requirements = await liveRequirements(db, tenant.id);
+      const unmet = requirements.filter((r) => !r.met);
+      if (unmet.length > 0) {
+        return reply
+          .status(409)
+          .type('application/problem+json')
+          .send({
+            ...rfc7807(
+              'live-requirements-unmet',
+              'Conflict',
+              409,
+              `Cannot activate live mode: ${unmet.map((r) => r.label).join('; ')}.`,
+            ),
+            requirements,
+          });
+      }
+
+      await db('tenants').where({ id: tenant.id }).update({ mode: 'live', updated_at: new Date() });
+      invalidateTenantConfig(tenant.id);
+      void getAuditLogger().log({
+        actorType: 'tenant',
+        actorId: tenant.id,
+        action: 'mode.activated_live',
+        resourceType: 'tenant',
+        resourceId: tenant.id,
+        metadata: { by: req.user?.id },
+      });
+      logger.info({ tenantId: tenant.id, by: req.user?.id }, 'workspace activated for live mode');
+      return reply.send({ mode: 'live', requirements });
+    },
+  );
+
+  // GET /auth/keys/requirements — checklist the dashboard renders before activation
+  app.get('/auth/keys/requirements', { preHandler: [authenticate] }, async (req, reply) => {
+    const tenant = req.tenant!;
+    const db = getDb();
+    const row = await db('tenants').where({ id: tenant.id }).first();
+    return reply.send({
+      mode: row?.mode ?? 'sandbox',
+      requirements: await liveRequirements(db, tenant.id),
+    });
+  });
 
   // GET /tenants/me
   app.get('/tenants/me', { preHandler: [authenticate] }, async (req, reply) => {

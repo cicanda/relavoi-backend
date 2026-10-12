@@ -69,11 +69,23 @@ export function buildRejectResponse(args: { reason: RejectReason; message?: stri
   ].join('');
 }
 
-export function buildPlayMessageResponse(audioUrl: string): string {
+/**
+ * Play a recording, or speak text when there is no recording to play.
+ *
+ * A decision may carry a message without an audio file (a sandbox notice, a
+ * tenant message with no uploaded clip). Previously only the URL was honoured,
+ * so those callers heard `<Play url="">` -- silence -- and the text was lost.
+ */
+export function buildPlayMessageResponse(audioUrl: string, text?: string): string {
+  const body = audioUrl
+    ? `<Play url="${escapeXml(audioUrl)}"/>`
+    : text
+      ? `<Say>${escapeXml(text)}</Say>`
+      : '';
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Response>',
-    `<Play url="${escapeXml(audioUrl)}"/>`,
+    body,
     '<Hangup/>',
     '</Response>',
   ].join('');

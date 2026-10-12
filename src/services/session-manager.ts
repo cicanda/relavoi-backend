@@ -94,6 +94,7 @@ export interface Session {
   maxDurationMin: number;
   recordingEnabled: boolean;
   consentPrompt: ConsentPrompt;
+  mode: 'sandbox' | 'live';
   expiresAt: Date;
   createdAt: Date;
   activatedAt: Date | null;
@@ -105,6 +106,9 @@ export interface Session {
 
 export interface CreateSessionArgs {
   tenantId: string;
+  /** Mode of the credential that opened this session. Decides whether its
+   *  calls and messages may reach the carrier. Defaults to sandbox. */
+  mode?: 'sandbox' | 'live';
   agentPhone: string;
   customerPhone: string;
   metadata?: Record<string, unknown>;
@@ -149,6 +153,7 @@ interface DbSessionRow {
   max_duration_min: number;
   recording_enabled: boolean;
   consent_prompt: ConsentPrompt;
+  mode: 'sandbox' | 'live';
   expires_at: Date | string;
   created_at: Date | string;
   activated_at: Date | string | null;
@@ -176,6 +181,7 @@ function rowToSession(r: DbSessionRow): Session {
     maxDurationMin: r.max_duration_min,
     recordingEnabled: r.recording_enabled,
     consentPrompt: r.consent_prompt,
+    mode: r.mode ?? 'sandbox',
     expiresAt: new Date(r.expires_at),
     createdAt: new Date(r.created_at),
     activatedAt: r.activated_at ? new Date(r.activated_at) : null,
@@ -230,6 +236,7 @@ export class SessionManager {
       recordingEnabled = false,
       consentPrompt = 'NONE',
       region,
+      mode = 'sandbox',
     } = args;
 
     if (!tenantId) throw err('TENANT_REQUIRED', 400, 'tenantId is required');
@@ -304,6 +311,7 @@ export class SessionManager {
         max_duration_min: maxDurationMinutes,
         recording_enabled: recordingEnabled,
         consent_prompt: consentPrompt,
+        mode,
         expires_at: expiresAt,
         created_at: now,
         call_count: 0,
@@ -329,6 +337,7 @@ export class SessionManager {
         max_duration_min: String(maxDurationMinutes),
         recording_enabled: recordingEnabled ? '1' : '0',
         consent_prompt: consentPrompt,
+        mode,
         expires_at: expiresAt.toISOString(),
         created_at: now.toISOString(),
         activated_at: now.toISOString(),
@@ -362,6 +371,7 @@ export class SessionManager {
         .publish('session.created', {
           tenantId,
           sessionId,
+          mode,
           proxyNumber: proxy,
           directionMode,
           recordingEnabled,
@@ -598,6 +608,7 @@ export class SessionManager {
       .publish('session.expired', {
         tenantId: row.tenant_id,
         sessionId: id,
+        mode: row.mode ?? 'sandbox',
         proxyNumber: row.proxy_number,
         timestamp: now.toISOString(),
       })

@@ -1,4 +1,5 @@
 import { logger } from '../utils/logger';
+import { getDb } from '../config/database';
 import { getEventBus, type EventHandler } from '../services/event-bus';
 import { getTenantWebhookDelivery } from '../services/tenant-webhook-delivery';
 import { getBillingManager, type BillingMetric } from '../services/billing-manager';
@@ -41,15 +42,39 @@ const KNOWN_METRICS = new Set<BillingMetric>([
   'number_rental',
 ]);
 
+/**
+ * Mode an event should be metered under.
+ *
+ * Prefers what the publisher asserted. Falls back to the session the event
+ * belongs to, because a session opened in sandbox must stay unbillable even if
+ * its tenant has since gone live. Unknown resolves to sandbox: never invent
+ * billable usage.
+ */
+async function resolveMode(payload: Record<string, unknown>): Promise<'sandbox' | 'live'> {
+  if (payload.mode === 'live') return 'live';
+  if (payload.mode === 'sandbox') return 'sandbox';
+  const sessionId = payload.sessionId;
+  if (typeof sessionId === 'string' && sessionId) {
+    try {
+      const row = await getDb()('sessions').select('mode').where({ id: sessionId }).first();
+      if (row?.mode === 'live') return 'live';
+    } catch (err) {
+      logger.warn({ err, sessionId }, 'event-consumers: mode lookup failed, metering as sandbox');
+    }
+  }
+  return 'sandbox';
+}
+
 async function safeMeterUsage(
   tenantId: string | null,
   metric: string,
   quantity: number,
+  mode: 'sandbox' | 'live' = 'sandbox',
 ): Promise<void> {
   if (!tenantId) return;
   if (!KNOWN_METRICS.has(metric as BillingMetric)) return;
   try {
-    await getBillingManager().recordUsage(tenantId, metric as BillingMetric, quantity);
+    await getBillingManager().recordUsage(tenantId, metric as BillingMetric, quantity, mode);
   } catch (err) {
     logger.warn({ err, tenantId, metric }, 'event-consumers: meter usage failed');
   }
@@ -105,7 +130,7 @@ export async function startEventConsumers(): Promise<void> {
   // session.created → metering + tenant-webhook
   await bus.subscribe('session.created', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
-      await safeMeterUsage(getTenantId(payload), 'session_created', 1);
+      await safeMeterUsage(getTenantId(payload), 'session_created', 1, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'session.created/metering handler error');
     }
@@ -131,7 +156,7 @@ export async function startEventConsumers(): Promise<void> {
   await bus.subscribe('session.expired', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
       // No additional metering on expiry by default — placeholder for future "session_lifetime" metric.
-      await safeMeterUsage(getTenantId(payload), 'session_expired', 1);
+      await safeMeterUsage(getTenantId(payload), 'session_expired', 1, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'session.expired/metering handler error');
     }
@@ -182,7 +207,7 @@ export async function startEventConsumers(): Promise<void> {
       const tenantId = getTenantId(payload);
       const seconds = Number((payload as Record<string, unknown>).durationSeconds ?? 0);
       const minutes = Math.max(1, Math.ceil(seconds / 60));
-      await safeMeterUsage(tenantId, 'call_minute', minutes);
+      await safeMeterUsage(tenantId, 'call_minute', minutes, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'call.ended/metering handler error');
     }
@@ -198,7 +223,7 @@ export async function startEventConsumers(): Promise<void> {
   }));
   await bus.subscribe('call.failed', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
-      await safeMeterUsage(getTenantId(payload), 'call_failed', 1);
+      await safeMeterUsage(getTenantId(payload), 'call_failed', 1, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'call.failed/metering handler error');
     }
@@ -207,7 +232,7 @@ export async function startEventConsumers(): Promise<void> {
   // sms.sent → metering + tenant-webhook
   await bus.subscribe('sms.sent', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
-      await safeMeterUsage(getTenantId(payload), 'sms_sent', 1);
+      await safeMeterUsage(getTenantId(payload), 'sms_sent', 1, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'sms.sent/metering handler error');
     }
@@ -223,7 +248,7 @@ export async function startEventConsumers(): Promise<void> {
   // sms.received → metering + tenant-webhook
   await bus.subscribe('sms.received', 'metering', CONSUMER, onPayload(async (payload: EventPayload) => {
     try {
-      await safeMeterUsage(getTenantId(payload), 'sms_received', 1);
+      await safeMeterUsage(getTenantId(payload), 'sms_received', 1, await resolveMode(payload));
     } catch (err) {
       logger.warn({ err }, 'sms.received/metering handler error');
     }

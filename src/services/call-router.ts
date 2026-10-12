@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getRedis } from '../config/redis';
 import { getDb } from '../config/database';
+import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { hashPhone } from '../utils/crypto';
 import { callRoutingDuration, callRoutingTotal } from '../utils/metrics';
@@ -37,6 +38,7 @@ export interface RouteDecision {
 
 interface RedisSessionHash {
   id?: string;
+  mode?: string;
   tenant_id?: string;
   party_a_hash?: string;
   party_b_hash?: string;
@@ -122,6 +124,25 @@ export class CallRouter {
 
     const session = matched.session;
     const tenantId = session.tenant_id as string;
+
+    // A sandbox session must never reach the real carrier. In an AT sandbox
+    // environment that is already true -- the provider itself is simulated --
+    // so routing proceeds normally and the integration behaves end to end.
+    // Against production the dial would be real and billable, so the call is
+    // answered with a message instead of a bridge.
+    const sessionMode = session.mode === 'live' ? 'live' : 'sandbox';
+    if (sessionMode === 'sandbox' && config.AT_ENVIRONMENT === 'production') {
+      const decision: RouteDecision = {
+        action: 'play_message',
+        message:
+          'This is a Relavoi sandbox session. No call was placed. Generate live API keys to connect real calls.',
+        sessionId: session.id as string,
+        tenantId,
+      };
+      await this.cacheDecision(args.eventId, decision);
+      stop('sandbox_simulated');
+      return decision;
+    }
 
     // Direction mode enforcement
     const direction = (session.direction_mode ?? 'BIDIRECTIONAL') as

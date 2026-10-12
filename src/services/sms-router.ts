@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getRedis } from '../config/redis';
 import { getDb } from '../config/database';
+import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { decryptPhone, encryptPhone, hashPhone } from '../utils/crypto';
 import { sendSms } from './africastalking/sms-sender';
@@ -53,6 +54,7 @@ export class SmsRouter {
       sessionId: string;
       tenantId: string;
       callerIsA: boolean;
+      mode: 'sandbox' | 'live';
       directionMode: 'BIDIRECTIONAL' | 'A_TO_B_ONLY' | 'B_TO_A_ONLY';
       partyAEnc?: Buffer;
       partyBEnc?: Buffer;
@@ -71,6 +73,7 @@ export class SmsRouter {
           sessionId: sid,
           tenantId: s.tenant_id,
           callerIsA: true,
+          mode: s.mode === 'live' ? 'live' : 'sandbox',
           directionMode: (s.direction_mode ?? 'BIDIRECTIONAL') as
             | 'BIDIRECTIONAL'
             | 'A_TO_B_ONLY'
@@ -83,6 +86,7 @@ export class SmsRouter {
           sessionId: sid,
           tenantId: s.tenant_id,
           callerIsA: false,
+          mode: s.mode === 'live' ? 'live' : 'sandbox',
           directionMode: (s.direction_mode ?? 'BIDIRECTIONAL') as
             | 'BIDIRECTIONAL'
             | 'A_TO_B_ONLY'
@@ -172,6 +176,7 @@ export class SmsRouter {
 
     // Forward via AT (fire-and-forget so webhook returns fast, but record status)
     void this.forward({
+      mode: matched.mode,
       smsRecordId,
       from: args.proxyNumber,
       to: destination,
@@ -185,6 +190,7 @@ export class SmsRouter {
   }
 
   private async forward(args: {
+    mode: 'sandbox' | 'live';
     smsRecordId: string;
     from: string;
     to: string;
@@ -193,7 +199,20 @@ export class SmsRouter {
     tenantId: string;
     direction: 'A_TO_B' | 'B_TO_A';
   }): Promise<void> {
-    const result = await sendSms({ from: args.from, to: args.to, message: args.body });
+    // sendSms bills real money. A sandbox session is allowed through only when
+    // the provider itself is a sandbox; against production it is recorded as
+    // sent without a request leaving the process, so the tenant still sees the
+    // full message trail while nothing is spent.
+    const simulate = args.mode === 'sandbox' && config.AT_ENVIRONMENT === 'production';
+    const result = simulate
+      ? { status: 'sent' as const, messageId: `sandbox_${args.smsRecordId}` }
+      : await sendSms({ from: args.from, to: args.to, message: args.body });
+    if (simulate) {
+      logger.info(
+        { smsRecordId: args.smsRecordId, sessionId: args.sessionId },
+        'SmsRouter: sandbox session, delivery simulated',
+      );
+    }
     const sent = result.status === 'sent';
     try {
       const db = getDb();

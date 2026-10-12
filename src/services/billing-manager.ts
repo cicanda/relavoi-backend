@@ -52,7 +52,19 @@ export class BillingManager {
    * eventually consistent; we'd rather lose a metric than fail a customer
    * call.
    */
-  async recordUsage(tenantId: string, metric: BillingMetric, quantity: number = 1): Promise<void> {
+  /**
+   * Record one metered event.
+   *
+   * Sandbox usage is still written -- the tenant sees their own numbers while
+   * integrating -- but tagged so it is excluded from anything billable. Mode
+   * defaults to sandbox: an unattributed event should never cost anyone money.
+   */
+  async recordUsage(
+    tenantId: string,
+    metric: BillingMetric,
+    quantity: number = 1,
+    mode: 'sandbox' | 'live' = 'sandbox',
+  ): Promise<void> {
     try {
       if (!tenantId) return;
       if (!Number.isFinite(quantity) || quantity <= 0) return;
@@ -68,6 +80,7 @@ export class BillingManager {
         billing_period_id: billingPeriodId,
         metric,
         quantity,
+        mode,
         recorded_at: new Date(),
       });
     } catch (err) {
@@ -120,11 +133,13 @@ export class BillingManager {
 
     try {
       const db = getDb();
+      // Billable totals count live usage only. Sandbox rows stay in the table
+      // for the tenant's own visibility but never reach an invoice.
       const rows = await db('usage_records')
         .select('metric')
         .sum<{ metric: BillingMetric; sum: string }[]>('quantity as sum')
         .count<{ metric: BillingMetric; sum: string; count: string }[]>('* as count')
-        .where({ tenant_id: tenantId })
+        .where({ tenant_id: tenantId, mode: 'live' })
         .andWhere('recorded_at', '>=', periodStart)
         .andWhere('recorded_at', '<', periodEnd)
         .groupBy('metric');

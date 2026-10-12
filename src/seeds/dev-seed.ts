@@ -7,7 +7,7 @@ import { logger } from '../utils/logger';
 const TENANT_ID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 const TENANT_NAME = 'Chowdeck';
 const BILLING_EMAIL = 'dev@chowdeck.com';
-const DEV_API_KEY = 'sk_test_relavoi_dev_0123456789abcdef';
+const DEV_API_KEY = 'rk_test_relavoi_dev_0123456789abcdef';
 const DEV_API_SECRET = 'secret_test_relavoi_dev_fedcba9876543210';
 
 const TENANT_USER_EMAIL = 'dev@chowdeck.com';
@@ -79,6 +79,9 @@ export async function runDevSeed(): Promise<void> {
   await db('tenants').insert({
     id: TENANT_ID,
     name: TENANT_NAME,
+    // The dev key is rk_test_, so the workspace belongs in sandbox. Keeps the
+    // seeded environment matching what a real new tenant gets.
+    mode: 'sandbox',
     api_key_hash: apiKeyHash,
     api_secret_hash: apiSecretHash,
     billing_email: BILLING_EMAIL,

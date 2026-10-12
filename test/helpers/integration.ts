@@ -18,8 +18,13 @@ import knexConfig from '../../src/config/knexfile';
 
 export const TEST_TENANT_ID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 export const TEST_TENANT_NAME = 'Chowdeck Test';
-export const TEST_API_KEY = 'rk_test_relavoi_dev_0123456789abcdef';
+// A credential's prefix decides the mode of the token it mints, so the fixture
+// holds BOTH pairs. Most suites exercise carrier routing and want the live
+// pair (the default); the sandbox suite asks for the test pair explicitly.
+export const TEST_API_KEY = 'rk_live_relavoi_dev_0123456789abcdef';
 export const TEST_API_SECRET = 'secret_test_relavoi_dev_fedcba9876543210';
+export const TEST_SANDBOX_API_KEY = 'rk_test_relavoi_dev_0123456789abcdef';
+export const TEST_SANDBOX_API_SECRET = 'secret_sandbox_relavoi_dev_0123456789';
 export const TEST_USER_EMAIL = 'dev@chowdeck.test';
 export const TEST_USER_PASSWORD = 'password123';
 export const TEST_USER_NAME = 'Adaeze Test';
@@ -174,13 +179,21 @@ export async function resetSessionState(db: Knex, opts: { region?: string; provi
 export async function seedTestTenant(db: Knex): Promise<{ tenantId: string; userId: string }> {
   const apiKeyHash = sha256(TEST_API_KEY);
   const apiSecretHash = await bcrypt.hash(TEST_API_SECRET, 4); // low cost for tests
+  const sandboxKeyHash = sha256(TEST_SANDBOX_API_KEY);
+  const sandboxSecretHash = await bcrypt.hash(TEST_SANDBOX_API_SECRET, 4);
   await db('tenants').insert({
     id: TEST_TENANT_ID,
     name: TEST_TENANT_NAME,
-    api_key_hash: apiKeyHash,
-    api_secret_hash: apiSecretHash,
+    live_api_key_hash: apiKeyHash,
+    live_api_secret_hash: apiSecretHash,
+    api_key_hash: sandboxKeyHash,
+    api_secret_hash: sandboxSecretHash,
     billing_email: TEST_USER_EMAIL,
     tier: 'GROWTH',
+    // Live by default: these fixtures exist to exercise carrier routing, and a
+    // sandbox session deliberately never dials. The sandbox suite opts into
+    // sandbox explicitly before it mints its token.
+    mode: 'live',
     workspace_slug: `chowdeck-test-${Date.now()}`,
     country: 'NG',
     industry: 'Delivery',
@@ -212,13 +225,21 @@ export async function seedTestTenant(db: Knex): Promise<{ tenantId: string; user
 export async function seedTestTenantDeterministic(db: Knex): Promise<{ tenantId: string; userId: string }> {
   const apiKeyHash = sha256(TEST_API_KEY);
   const apiSecretHash = await bcrypt.hash(TEST_API_SECRET, 4);
+  const sandboxKeyHash = sha256(TEST_SANDBOX_API_KEY);
+  const sandboxSecretHash = await bcrypt.hash(TEST_SANDBOX_API_SECRET, 4);
   await db('tenants').insert({
     id: TEST_TENANT_ID,
     name: TEST_TENANT_NAME,
-    api_key_hash: apiKeyHash,
-    api_secret_hash: apiSecretHash,
+    live_api_key_hash: apiKeyHash,
+    live_api_secret_hash: apiSecretHash,
+    api_key_hash: sandboxKeyHash,
+    api_secret_hash: sandboxSecretHash,
     billing_email: TEST_USER_EMAIL,
     tier: 'GROWTH',
+    // Live by default: these fixtures exist to exercise carrier routing, and a
+    // sandbox session deliberately never dials. The sandbox suite opts into
+    // sandbox explicitly before it mints its token.
+    mode: 'live',
     country: 'NG',
     industry: 'Delivery',
     cooldown_min: 0,
@@ -346,11 +367,15 @@ export async function buildTestApp(): Promise<FastifyInstance> {
 /**
  * Exchange the test tenant's API key+secret for an SDK JWT.
  */
-export async function getSdkToken(app: FastifyInstance): Promise<string> {
+export async function getSdkToken(
+  app: FastifyInstance,
+  apiKey = TEST_API_KEY,
+  apiSecret = TEST_API_SECRET,
+): Promise<string> {
   const res = await app.inject({
     method: 'POST',
     url: '/v1/auth/token',
-    payload: { apiKey: TEST_API_KEY, apiSecret: TEST_API_SECRET },
+    payload: { apiKey, apiSecret },
   });
   if (res.statusCode !== 200) {
     throw new Error(`getSdkToken failed: ${res.statusCode} ${res.body}`);

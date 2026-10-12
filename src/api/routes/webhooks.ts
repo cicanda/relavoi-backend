@@ -74,6 +74,53 @@ function cpaasSignatureValid(req: FastifyRequest): boolean {
   );
 }
 
+
+/**
+ * Shadow-mode observation of CPaaS callback authenticity. Observes only; it
+ * never rejects.
+ *
+ * We do not currently know whether the provider signs voice callbacks at all,
+ * and enforcement was turning itself off in practice because the existing gate
+ * is skipped whenever AT_ENVIRONMENT is 'sandbox' -- which is what the
+ * production box is set to. Rather than guess at a scheme and break live calls,
+ * record what real callbacks actually carry and decide from evidence.
+ *
+ * Logs header names, the source IP and whether a signature would have verified.
+ * Never logs header VALUES (a signature is a bearer-equivalent secret) and
+ * never logs the body, which carries subscriber numbers.
+ */
+function observeWebhookAuth(req: FastifyRequest, channel: 'voice' | 'sms'): void {
+  try {
+    const headerNames = Object.keys(req.headers).filter(
+      (h) => !h.startsWith('x-forwarded') && h !== 'cookie' && h !== 'authorization',
+    );
+    const sigHeader =
+      req.headers['x-africastalking-signature'] ?? req.headers['x-at-signature'];
+    const present = Boolean(sigHeader);
+    logger.info(
+      {
+        channel,
+        sourceIp: req.ip,
+        forwardedFor: req.headers['x-forwarded-for'] ?? null,
+        signatureHeaderPresent: present,
+        // Which of the two header spellings arrived, if either.
+        signatureHeaderName: req.headers['x-africastalking-signature']
+          ? 'x-africastalking-signature'
+          : req.headers['x-at-signature']
+            ? 'x-at-signature'
+            : null,
+        wouldVerify: present ? cpaasSignatureValid(req) : false,
+        headerNames,
+        userAgent: req.headers['user-agent'] ?? null,
+        hasRawBody: Boolean(req.rawBody),
+      },
+      'cpaas-webhook-auth-shadow',
+    );
+  } catch (err) {
+    logger.warn({ err }, 'cpaas-webhook-auth-shadow failed (ignored)');
+  }
+}
+
 export async function webhookRoutes(app: FastifyInstance): Promise<void> {
   // Scoped override of the form-body parser: keeps the raw bytes on
   // req.rawBody so CPaaS signatures can be verified against the exact payload
@@ -98,6 +145,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /webhooks/cpaas/voice
   app.post('/webhooks/cpaas/voice', async (req, reply) => {
+    observeWebhookAuth(req, 'voice');
     if (config.AT_ENVIRONMENT !== 'sandbox' && !cpaasSignatureValid(req)) {
       logger.warn({ ip: req.ip }, 'CPaaS webhook signature verification failed');
       reply.type('text/xml');
@@ -153,6 +201,7 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /webhooks/cpaas/sms
   app.post('/webhooks/cpaas/sms', async (req, reply) => {
+    observeWebhookAuth(req, 'sms');
     if (config.AT_ENVIRONMENT !== 'sandbox' && !cpaasSignatureValid(req)) {
       logger.warn({ ip: req.ip }, 'CPaaS webhook signature verification failed');
       reply.type('text/xml');

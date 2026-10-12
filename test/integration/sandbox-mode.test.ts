@@ -21,6 +21,8 @@ import {
   getDashboardToken,
   disconnectRedis,
   TEST_TENANT_ID,
+  TEST_SANDBOX_API_KEY,
+  TEST_SANDBOX_API_SECRET,
 } from '../helpers/integration';
 import crypto from 'crypto';
 import { getRedis } from '../../src/config/redis';
@@ -83,7 +85,12 @@ describe('sandbox vs live mode (integration)', () => {
     await seedTestTenantDeterministic(db);
     proxyNumbers = await seedProxyNumbers(db, { count: 5, region: 'lagos' });
     app = await buildTestApp();
-    sdkToken = await getSdkToken(app);
+    // The token carries the mode of the tenant at exchange time, so the
+    // workspace must be sandboxed before the SDK token is minted.
+    await db('tenants').where({ id: TEST_TENANT_ID }).update({ mode: 'sandbox' });
+    // Authenticate with the TEST pair: the key's prefix is what puts the
+    // resulting token -- and every session it opens -- in sandbox.
+    sdkToken = await getSdkToken(app, TEST_SANDBOX_API_KEY, TEST_SANDBOX_API_SECRET);
     dashToken = await getDashboardToken(app);
   });
 
@@ -200,43 +207,65 @@ describe('sandbox vs live mode (integration)', () => {
 
   // ─── the part that actually guards spend ──────────────────────────────────
 
-  it('(f) against an AT sandbox, a sandbox session routes normally', async () => {
+  it('(f) a sandbox session never dials, regardless of provider config', async () => {
+    // The guard keys off the session alone now. AT_ENVIRONMENT is left exactly
+    // as the suite configures it ('sandbox') precisely to prove the two are no
+    // longer coupled: this is the configuration under which the old code DID
+    // dial for sandbox tenants.
     expect(config.AT_ENVIRONMENT).toBe('sandbox');
-    const s = (await createSession()).json() as { proxyNumber: string };
-    const xml = await dial(AGENT, s.proxyNumber);
-    expect(xml).toContain('<Dial');
-    expect(xml).toContain(CUSTOMER);
-  });
 
-  it('(g) against production, a sandbox session is simulated and never dials', async () => {
-    const s = (await createSession()).json() as { proxyNumber: string };
-    // The guard keys off the live provider environment, not the test env.
-    const original = config.AT_ENVIRONMENT;
-    config.AT_ENVIRONMENT = 'production';
-    try {
-      const xml = await dial(AGENT, s.proxyNumber);
-      expect(xml).not.toContain('<Dial');
-      expect(xml.toLowerCase()).toContain('sandbox');
-      expect(xml).not.toContain(CUSTOMER);
-    } finally {
-      config.AT_ENVIRONMENT = original;
-    }
-  });
-
-  it('(h) a live session still dials against production', async () => {
     const s = (await createSession()).json() as { id: string; proxyNumber: string };
-    // Promote the session as activation would for newly created ones.
+    const xml = await dial(AGENT, s.proxyNumber);
+
+    expect(xml).not.toContain('<Dial');
+    // Party B's number must not leave the platform for a sandbox session.
+    expect(xml).not.toContain(CUSTOMER);
+    expect(xml.toLowerCase()).toContain('sandbox');
+
+    // call_records are written off the routing path.
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await db('call_records').where({ session_id: s.id });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].simulated).toBe(true);
+    expect(rows[0].mode).toBe('sandbox');
+    expect(rows[0].duration_seconds).toBe(0);
+  });
+
+  it('(g) a live session still dials, under the same provider config', async () => {
+    const s = (await createSession()).json() as { id: string; proxyNumber: string };
     await db('sessions').where({ id: s.id }).update({ mode: 'live' });
     await getRedis().hset(`session:${s.id}`, 'mode', 'live');
 
-    const original = config.AT_ENVIRONMENT;
-    config.AT_ENVIRONMENT = 'production';
-    try {
-      const xml = await dial(AGENT, s.proxyNumber);
-      expect(xml).toContain('<Dial');
-      expect(xml).toContain(CUSTOMER);
-    } finally {
-      config.AT_ENVIRONMENT = original;
+    const xml = await dial(AGENT, s.proxyNumber);
+    expect(xml).toContain('<Dial');
+    expect(xml).toContain(CUSTOMER);
+
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await db('call_records').where({ session_id: s.id });
+    expect(rows[0].simulated).toBe(false);
+    expect(rows[0].mode).toBe('live');
+  });
+
+  it('(h) a sandbox session never hands an SMS to the provider', async () => {
+    const s = (await createSession()).json() as { id: string };
+    const body = new URLSearchParams({
+      from: AGENT,
+      to: '+2342017001428',
+      text: 'sandbox message',
+      date: new Date().toISOString(),
+      id: `sms_${Date.now()}`,
+    }).toString();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/webhooks/cpaas/sms',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      payload: body,
+    });
+    await new Promise((r) => setTimeout(r, 500));
+    const rows = await db('sms_records').where({ session_id: s.id });
+    if (rows.length > 0) {
+      expect(rows.every((r: { simulated: boolean }) => r.simulated)).toBe(true);
+      expect(rows.every((r: { mode: string }) => r.mode === 'sandbox')).toBe(true);
     }
   });
 

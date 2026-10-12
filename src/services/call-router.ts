@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getRedis } from '../config/redis';
 import { getDb } from '../config/database';
-import { config } from '../config/env';
+import { getEventBus } from './event-bus';
 import { logger } from '../utils/logger';
 import { hashPhone } from '../utils/crypto';
 import { callRoutingDuration, callRoutingTotal } from '../utils/metrics';
@@ -125,20 +125,46 @@ export class CallRouter {
     const session = matched.session;
     const tenantId = session.tenant_id as string;
 
-    // A sandbox session must never reach the real carrier. In an AT sandbox
-    // environment that is already true -- the provider itself is simulated --
-    // so routing proceeds normally and the integration behaves end to end.
-    // Against production the dial would be real and billable, so the call is
-    // answered with a message instead of a bridge.
+    // A sandbox session never reaches the carrier. This keys off the session
+    // alone, deliberately: AT_ENVIRONMENT describes which provider endpoint and
+    // credentials we use, and says nothing about whether a given tenant's
+    // traffic should be carried. Tying the two together meant a box configured
+    // with AT_ENVIRONMENT=sandbox would happily place real, billable calls for
+    // sandbox tenants on real DIDs.
+    //
+    // The caller hears a message and no second leg is ever dialled, so party
+    // B's number never leaves the platform for a sandbox session.
     const sessionMode = session.mode === 'live' ? 'live' : 'sandbox';
-    if (sessionMode === 'sandbox' && config.AT_ENVIRONMENT === 'production') {
+    if (sessionMode === 'sandbox') {
       const decision: RouteDecision = {
         action: 'play_message',
-        message:
-          'This is a Relavoi sandbox session. No call was placed. Generate live API keys to connect real calls.',
+        message: 'This is a Relavoi sandbox session. No call was connected.',
         sessionId: session.id as string,
         tenantId,
       };
+      // Recorded so the tenant sees the attempt in their call history, flagged
+      // so it is never mistaken for carried traffic.
+      void this.writeCallRecord({
+        callRecordId: randomUUID(),
+        sessionId: session.id as string,
+        direction: matched.callerIsA ? 'A_TO_B' : 'B_TO_A',
+        cpaasCallId: args.eventId,
+        recordingConsentPlayed: false,
+        partyBHash: session.party_b_hash as string | undefined,
+        mode: 'sandbox',
+        simulated: true,
+      });
+      void this.bumpSessionCallCount(session.id as string);
+      void getEventBus()
+        .publish('call.simulated', {
+          tenantId,
+          sessionId: session.id as string,
+          mode: 'sandbox',
+          simulated: true,
+          durationSeconds: 0,
+          timestamp: new Date().toISOString(),
+        })
+        .catch(() => undefined);
       await this.cacheDecision(args.eventId, decision);
       stop('sandbox_simulated');
       return decision;
@@ -240,6 +266,8 @@ export class CallRouter {
       cpaasCallId: args.eventId,
       recordingConsentPlayed: action === 'consent_then_forward',
       partyBHash: session.party_b_hash as string | undefined,
+      mode: 'live',
+      simulated: false,
     });
     void this.bumpSessionCallCount(session.id as string);
 
@@ -359,6 +387,10 @@ export class CallRouter {
      * reached; capture it per call.
      */
     partyBHash?: string;
+    /** Mode in force when the call was routed. */
+    mode?: 'sandbox' | 'live';
+    /** True when nothing was carried on the network. */
+    simulated?: boolean;
   }): Promise<void> {
     try {
       const db = getDb();
@@ -371,6 +403,9 @@ export class CallRouter {
         status: 'RINGING',
         recording_consent_played: args.recordingConsentPlayed,
         party_b_phone_hash: args.partyBHash ?? null,
+        mode: args.mode ?? 'live',
+        simulated: args.simulated ?? false,
+        duration_seconds: args.simulated ? 0 : null,
         initiated_at: new Date(),
       });
     } catch (e) {

@@ -1,7 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getRedis } from '../config/redis';
 import { getDb } from '../config/database';
-import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { decryptPhone, encryptPhone, hashPhone } from '../utils/crypto';
 import { sendSms } from './africastalking/sms-sender';
@@ -199,11 +198,11 @@ export class SmsRouter {
     tenantId: string;
     direction: 'A_TO_B' | 'B_TO_A';
   }): Promise<void> {
-    // sendSms bills real money. A sandbox session is allowed through only when
-    // the provider itself is a sandbox; against production it is recorded as
-    // sent without a request leaving the process, so the tenant still sees the
-    // full message trail while nothing is spent.
-    const simulate = args.mode === 'sandbox' && config.AT_ENVIRONMENT === 'production';
+    // sendSms reaches a real provider and bills real money. A sandbox session
+    // never does, keyed off the session alone -- AT_ENVIRONMENT describes which
+    // provider endpoint we talk to, not whose traffic deserves to be carried.
+    // The tenant still sees the full message trail; nothing leaves the process.
+    const simulate = args.mode === 'sandbox';
     const result = simulate
       ? { status: 'sent' as const, messageId: `sandbox_${args.smsRecordId}` }
       : await sendSms({ from: args.from, to: args.to, message: args.body });
@@ -221,6 +220,8 @@ export class SmsRouter {
         .update({
           status: sent ? 'DELIVERED' : 'FAILED',
           cpaas_message_id: result.messageId ?? null,
+          mode: args.mode,
+          simulated: simulate,
           delivered_at: sent ? new Date() : null,
         });
     } catch (e) {

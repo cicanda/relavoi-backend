@@ -7,6 +7,7 @@ import { config } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { adminAuthenticate, requireRole } from '../middleware/admin-auth';
 import { getNumberPool } from '../../services/number-pool';
+import { getSessionManager } from '../../services/session-manager';
 import { getAuditLogger } from '../../services/audit-logger';
 import { getBillingManager } from '../../services/billing-manager';
 import { getCircuitBreaker } from '../../services/circuit-breaker';
@@ -375,6 +376,65 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         .catch((err) => logger.warn({ err }, 'audit log failed'));
 
       return reply.send({ id: req.params.id, status: parsed.data.status });
+    },
+  );
+
+  // ─── POST /admin/sessions/:id/expire ──────────────────────────────────────────
+  //
+  // Force a session to EXPIRED through the normal lifecycle path.
+  //
+  // Exists so test and stuck sessions are never cleaned up with raw SQL.
+  // Deleting session rows directly leaves Redis holding the proxy: the number
+  // stays in pool:{region}:in_use and keeps a membership in
+  // proxy:{number}:sessions, which release() counts -- so the number becomes
+  // permanently unreleasable. expireSession() unwinds all of that, returns the
+  // proxy to cooldown, and publishes session.expired.
+  app.post<{ Params: { id: string } }>(
+    '/admin/sessions/:id/expire',
+    { preHandler: [adminAuthenticate, requireRole('SRE', 'ROOT')] },
+    async (req, reply) => {
+      const db = getDb();
+      const row = await db('sessions').where({ id: req.params.id }).first();
+      if (!row) {
+        return reply
+          .status(404)
+          .type('application/problem+json')
+          .send(rfc7807('not-found', 'Not Found', 404, 'Session not found.'));
+      }
+      if (row.state === 'EXPIRED') {
+        // Idempotent: already expired is a success.
+        return reply.send({ id: row.id, state: 'EXPIRED', alreadyExpired: true });
+      }
+
+      const ok = await getSessionManager().expireSession(req.params.id);
+      if (!ok) {
+        return reply
+          .status(500)
+          .type('application/problem+json')
+          .send(rfc7807('expire-failed', 'Internal Server Error', 500, 'Could not expire session.'));
+      }
+
+      void getAuditLogger().log({
+        actorType: 'operator',
+        actorId: req.operator!.id,
+        action: 'session.force_expired',
+        resourceType: 'session',
+        resourceId: req.params.id,
+        metadata: { previousState: row.state, tenantId: row.tenant_id },
+      });
+      logger.info(
+        { sessionId: req.params.id, by: req.operator?.id, previousState: row.state },
+        'session force-expired by operator',
+      );
+
+      const fresh = await db('sessions').where({ id: req.params.id }).first();
+      return reply.send({
+        id: fresh.id,
+        state: fresh.state,
+        proxyNumber: fresh.proxy_number,
+        expiredAt: fresh.expired_at,
+        alreadyExpired: false,
+      });
     },
   );
 

@@ -405,4 +405,42 @@ describe('ADMIN — operator console', () => {
     // restore tier
     await db('tenants').where({ id: TEST_TENANT_ID }).update({ tier: 'GROWTH' });
   });
+
+  it('(p) operator can force-expire a session, and the proxy returns to the pool', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/sessions',
+      headers: { authorization: `Bearer ${sdkToken}` },
+      payload: { agentPhone: '+2348077770001', customerPhone: '+2349077770002' },
+    });
+    expect(created.statusCode).toBe(201);
+    const s = created.json() as { id: string; proxyNumber: string };
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/admin/sessions/${s.id}/expire`,
+      headers: { authorization: `Bearer ${operatorToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { state: string }).state).toBe('EXPIRED');
+
+    // Redis must not keep the proxy mapped to a dead session -- the failure
+    // this route exists to prevent.
+    const { getRedis } = await import('../../src/config/redis');
+    const redis = getRedis();
+    expect(await redis.sismember(`proxy:${s.proxyNumber}:sessions`, s.id)).toBe(0);
+    expect(await redis.exists(`session:${s.id}`)).toBe(0);
+
+    const audit = await db('audit_log').where({ action: 'session.force_expired' });
+    expect(audit.length).toBeGreaterThanOrEqual(1);
+
+    // Idempotent.
+    const again = await app.inject({
+      method: 'POST',
+      url: `/v1/admin/sessions/${s.id}/expire`,
+      headers: { authorization: `Bearer ${operatorToken}` },
+    });
+    expect(again.statusCode).toBe(200);
+    expect((again.json() as { alreadyExpired: boolean }).alreadyExpired).toBe(true);
+  });
 });
